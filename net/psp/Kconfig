@@ -1,0 +1,10 @@
+#
+# PSP security protocol configuration
+#
+
+menuconfig NET_PSP
+	bool "PSP Security Protocol"
+	default Y
+	help
+	  Say Y here to add support of the PSP security protocol.
+	  For details see Google's post about it being open sourced.
