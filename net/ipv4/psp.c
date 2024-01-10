@@ -39,11 +39,65 @@ static int psp_sock_create(struct net *net, struct socket *sock, int protocol, i
 static int psp_init(){
 	int rc;
 	rc = proto_register(&psp_prot, 1);
+	rc = sock_register(&psp_family);
 	return rc;
+}
+
+static void psp_close(struct sock *sk, long timeout){
+	// !TODO
+}
+
+static int psp_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len){
+	// !TODO
+}
+
+static int psp_disconnect(struct sock *sk, int flags){
+	// !TODO
+}
+
+static int psp_accept(struct sock *sk, struct socket *newsock, int flags){
+	// !TODO
+}
+
+static int psp_ioctl(struct sock *sk, int cmd, unsigned long arg){
+	// !TODO
+}
+
+static int psp_init_sock(struct sock *sk){
+	// !TODO
+}
+
+static int psp_shutdown(struct sock *sk, int how){
+	// !TODO
+}
+
+static int psp_setsockopt(struct sock *sk, int level, int optname, char __user *optval, unsigned int optlen){
+	// !TODO
+}
+
+static int psp_getsockopt(struct sock *sk, int level, int optname, char __user *optval, int __user *optlen){
+	// !TODO
+}
+
+static int psp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len){
+	// !TODO
+}
+
+static int psp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int noblock, int flags, int *addr_len){
+	// !TODO
+}
+
+static void psp_unhash(struct sock *sk){
+	// !TODO
+}
+
+static int psp_get_port(struct sock *sk, unsigned short snum){
+	// !TODO
 }
 
 static int psp_cleanup(){
 	proto_unregister(&psp_prot);
+	sock_unregister(PF_PSP);
 	return 0;
 }
 
@@ -51,26 +105,19 @@ module_init(psp_init);
 module_exit(psp_cleanup);
 
 static const struct proto psp_prot = {
-	.close = my_close,
-	.connect = my_connect,
-	.disconnect = my_disconnect,
-	.accept = my_accept,
-	.ioctl = my_ioctl,
-	.init = my_init_sock,
-	.shutdown = my_shutdown,
-	.setsockopt = my_setsockopt,
-	.getsockopt = my_getsockopt,
-	.sendmsg = my_sendmsg,
-	.recvmsg = my_recvmsg,
-	.unhash = my_unhash,	// remove from hash tables
-	.get_port = my_get_port, // get port 
-	.sockets_allocated = &sockets_allocated,
-	.memory_allocated = &memory_allocated,
-	.memory_pressure = &memory_pressure,
-	.orphan_count = &orphan_count,
-	.sysctl_mem = sysctl_tcp_mem,
-	.sysctl_wmem = sysctl_tcp_wmem,
-	.sysctl_rmem = sysctl_tcp_rmem,
+	.close = psp_close,
+	.connect = psp_connect,
+	.disconnect = psp_disconnect,
+	.accept = psp_accept,
+	.ioctl = psp_ioctl,
+	.init = psp_init_sock,
+	.shutdown = psp_shutdown,
+	.setsockopt = psp_setsockopt,
+	.getsockopt = psp_getsockopt,
+	.sendmsg = psp_sendmsg,
+	.recvmsg = psp_recvmsg,
+	.unhash = psp_unhash,	// remove from hash tables
+	.get_port = psp_get_port, // get port 
 	.max_header = 0,
 	.obj_size = sizeof(struct psp_sock),
 	.owner = THIS_MODULE,
