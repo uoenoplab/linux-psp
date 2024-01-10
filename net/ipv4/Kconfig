@@ -679,6 +679,13 @@ config TCP_CONG_BBR
 	  AQM schemes that do not provide a delay signal. It requires the fq
 	  ("Fair Queue") pacing packet scheduler.
 
+config NET_PSP
+	bool "PSP Security Protocol"
+	default Y
+	help
+	  The PSP Security Protocol was engineered by Google to improve scalability
+	  in a datacenter environment.
+
 choice
 	prompt "Default TCP congestion control"
 	default DEFAULT_CUBIC
