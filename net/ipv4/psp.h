@@ -23,3 +23,8 @@ struct psp_hdr {
 	__be64		VC;	/* Virtualisation Cookie (only present if V is set) */
 };
 
+static inline struct psp_sock *psp_sk(const struct sock *sk)
+{
+	return (struct psp_sock *)sk;
+}
+

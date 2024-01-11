@@ -7,9 +7,9 @@
 #include "psp.h"
 
 // structs needed to define protocol
-static const struct proto psp_prot;
-static const struct proto_ops psp_ops;
-static const struct net_proto_family psp_family;
+static struct proto psp_prot;
+static struct proto_ops psp_ops;
+static struct net_proto_family psp_family;
 
 struct psp_sock {
 	struct inet_sock isock;
@@ -21,7 +21,7 @@ static int psp_sock_create(struct net *net, struct socket *sock, int protocol, i
 	int rc;
 	sk = sk_alloc(net, PF_PSP, GFP_KERNEL, &psp_prot, kern);
 	if (!sk) {
-		printk(KERN_ERR, "psp: sk_alloc failed\n");
+		printk(KERN_ERR "psp: sk_alloc failed\n");
 		return -ENOMEM;
 	}
 
@@ -36,10 +36,11 @@ static int psp_sock_create(struct net *net, struct socket *sock, int protocol, i
 	return 0;
 }
 
-static int psp_init(){
+static int psp_init(void){
 	int rc;
 	rc = proto_register(&psp_prot, 1);
 	rc = sock_register(&psp_family);
+	printk(KERN_INFO "psp: module loaded\n");
 	return rc;
 }
 
@@ -49,42 +50,53 @@ static void psp_close(struct sock *sk, long timeout){
 
 static int psp_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len){
 	// !TODO
+	return 0;
 }
 
 static int psp_disconnect(struct sock *sk, int flags){
 	// !TODO
+	return 0;
 }
 
 static int psp_accept(struct sock *sk, struct socket *newsock, int flags){
 	// !TODO
+	return 0;
 }
 
 static int psp_ioctl(struct sock *sk, int cmd, unsigned long arg){
 	// !TODO
+	return 0;
 }
 
 static int psp_init_sock(struct sock *sk){
-	// !TODO
+	struct inet_connection_sock *icsk = inet_csk(sk);
+	struct psp_sock *psk = psp_sk(sk);
+	return 0;
 }
 
 static int psp_shutdown(struct sock *sk, int how){
 	// !TODO
+	return 0;
 }
 
 static int psp_setsockopt(struct sock *sk, int level, int optname, char __user *optval, unsigned int optlen){
 	// !TODO
+	return 0;
 }
 
 static int psp_getsockopt(struct sock *sk, int level, int optname, char __user *optval, int __user *optlen){
 	// !TODO
+	return 0;
 }
 
 static int psp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len){
 	// !TODO
+	return 0;
 }
 
 static int psp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int noblock, int flags, int *addr_len){
 	// !TODO
+	return 0;
 }
 
 static void psp_unhash(struct sock *sk){
@@ -93,25 +105,26 @@ static void psp_unhash(struct sock *sk){
 
 static int psp_get_port(struct sock *sk, unsigned short snum){
 	// !TODO
+	return 0;
 }
 
-static int psp_cleanup(){
+static int psp_cleanup(void){
 	proto_unregister(&psp_prot);
 	sock_unregister(PF_PSP);
 	return 0;
 }
 
-module_init(psp_init);
-module_exit(psp_cleanup);
+//module_init(psp_init);
+//module_exit(psp_cleanup);
 
-static const struct proto psp_prot = {
+static struct proto psp_prot = {
 	.close = psp_close,
 	.connect = psp_connect,
 	.disconnect = psp_disconnect,
 	.accept = psp_accept,
 	.ioctl = psp_ioctl,
 	.init = psp_init_sock,
-	.shutdown = psp_shutdown,
+	// .shutdown = psp_shutdown,
 	.setsockopt = psp_setsockopt,
 	.getsockopt = psp_getsockopt,
 	.sendmsg = psp_sendmsg,
@@ -124,7 +137,7 @@ static const struct proto psp_prot = {
 	.name = "PSP",
 };
 
-static const struct proto_ops psp_ops = {
+static struct proto_ops psp_ops = {
 	.family = PF_INET,
 	.owner = THIS_MODULE,
 	.release = inet_release,
@@ -143,7 +156,7 @@ static const struct proto_ops psp_ops = {
 	.recvmsg = sock_common_recvmsg,
 };
 
-static const struct net_proto_family psp_family = {
+static struct net_proto_family psp_family = {
 	.family = PF_INET,
 	.create = psp_sock_create,
 	.owner = THIS_MODULE,
