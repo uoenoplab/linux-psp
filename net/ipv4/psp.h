@@ -1,12 +1,16 @@
 #include <linux/types.h>
-#include <linux/skbuff.h>
 
-// 25 seems like a good number
-#define AF_PSP		25
-#define PF_PSP		AF_PSP
-#define PSP_PROTO_NAME			"PSP"
-#define PSP_PROC_NET_FILENAME		"PSP_stats"
-#define PSP_PROC_FULL_FILENAME		"/proc/net/" PSP_PROC_NET_FILENAME
+struct psp_ctx {
+	struct udp_psp_hdr	*udp_psp_hdr;
+	struct psp_hdr		*psp_hdr;
+};
+
+struct udp_psp_hdr {
+	__be16		source;
+	__be16		dest;
+	__be16		len;
+	__be16		check;
+};
 
 struct psp_hdr {
 	__u8		next_header;
@@ -23,8 +27,11 @@ struct psp_hdr {
 	__be64		VC;	/* Virtualisation Cookie (only present if V is set) */
 };
 
-static inline struct psp_sock *psp_sk(const struct sock *sk)
-{
-	return (struct psp_sock *)sk;
-}
+struct psp_trailer {
+	uint64_t	ICV[2];	/* Integrity Checksum Value */
+};
 
+static inline struct psp_ctx *psp_get_ctx(const struct sock *sk){
+	struct inet_connection_sock *icsk = inet_csk(sk);
+	return (struct psp_ctx *)icsk->icsk_ulp_data;
+} 

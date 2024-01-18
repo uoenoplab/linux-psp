@@ -117,6 +117,12 @@ struct linux_tls_mib {
 	unsigned long	mibs[LINUX_MIB_TLSMAX];
 };
 
+// PSP
+#define LINUX_MIB_PSPMAX	__LINUX_MIB_PSPMAX
+struct linux_psp_mib {
+	unsigned long	mibs[LINUX_MIB_PSPMAX];
+};
+
 #define DEFINE_SNMP_STAT(type, name)	\
 	__typeof__(type) __percpu *name
 #define DEFINE_SNMP_STAT_ATOMIC(type, name)	\

@@ -680,8 +680,8 @@ config TCP_CONG_BBR
 	  ("Fair Queue") pacing packet scheduler.
 
 config NET_PSP
-	bool "PSP Security Protocol"
-	default Y
+	tristate "PSP Security Protocol"
+	default m
 	help
 	  The PSP Security Protocol was engineered by Google to improve scalability
 	  in a datacenter environment.
