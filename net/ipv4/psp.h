@@ -1,8 +1,26 @@
 #include <linux/types.h>
+#include <linux/socket.h>
+
+struct psp_cypto_info {
+	unsigned char SPI[4];
+	unsigned char IV[8];
+	unsigned char key[16];
+	unsigned int crypt_offset;
+	unsigned int lifetime;
+};
 
 struct psp_ctx {
+	struct psp_crypto_info *crypto_info_send;
+	struct psp_crypto_info *crypto_info_recv;
+	struct sock *sk;
+	struct proto *proto;
+	struct psp_data *psp_data;
+};
+
+struct psp_data {
 	struct udp_psp_hdr	*udp_psp_hdr;
 	struct psp_hdr		*psp_hdr;
+	struct psp_trailer	*psp_trailer;
 };
 
 struct udp_psp_hdr {

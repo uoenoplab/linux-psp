@@ -40,13 +40,27 @@ static ssize_t psp_splice_read(struct socket *sock, loff_t *ppos, struct pipe_in
 static int psp_setsockopt(struct sock *sk, int level, int optname, sockptr_t optval, unsigned int optlen){
 	// return code
 	int rc = 0;
+	struct psp_ctx *ctx = psp_get_ctx(sk);
+	struct psp_crypto_info *crypto_info;
 	printk(KERN_INFO "PSP: setting socket option\n");
+
+	struct psp_crypto_info *crypto_info;
+	if (level != SOL_PSP){
+		return ctx->proto->setsockopt(sk, level, optname, optval, optlen);
+	}
+
+	
+	
 	return rc;
 }
 
 static int psp_getsockopt(struct sock *sk, int level, int optname, char __user *optval, int __user *optlen){
 	// return code
 	int rc = 0;
+	if ()
+	switch (optname) {
+		case 
+	}
 	printk(KERN_INFO "PSP: getting socket option\n");
 	return rc;
 }
@@ -96,7 +110,10 @@ static void psp_update(struct sock *sk, struct proto *p,
 static int psp_get_info(const struct sock *sk, struct sk_buff *skb){
 	// return code
 	int rc = 0;
+	unsigned char *data;
+	data = skb->data;
 	printk(KERN_INFO "PSP: getting info\n");
+	printk(KERN_INFO "PSP: data %s\n", *data);
 	return rc;
 }
 
@@ -126,10 +143,23 @@ static const struct snmp_mib psp_mib_list[] = {
 	SNMP_MIB_SENTINEL
 };
 
+struct psp_ctx *psp_ctx_create(struct sock *sk){
+	struct inet_connection_sock *icsk = inet_csk(sk);
+	struct psp_ctx *ctx;
+	ctx = kzalloc(sizeof(*ctx), GFP_ATOMIC);
+	if (!ctx){
+		return NULL;
+	}
+	rcu_assign_pointer(icsk->icsk_ulp_data, ctx);
+	ctx->sk = sk;
+	ctx->proto = sk->sk_prot;
+	return ctx;
+};
+
 static int psp_init(struct sock *sk){
 	// return code
 	int rc = 0;
-
+	struct psp_ctx *ctx;
 
 	// using ulp only works in an established state
 	if (sk->sk_state != TCP_ESTABLISHED){
@@ -140,6 +170,9 @@ static int psp_init(struct sock *sk){
 	// replace proto methods with psp specific methods
 	struct proto *prot = READ_ONCE(sk->sk_prot);
 	struct proto_ops *proto_ops = READ_ONCE(sk->sk_socket->ops);
+
+	// make context before setting new function pointers
+	ctx = psp_ctx_create(sk);
 
 	proto_ops->sendpage_locked = psp_sendpage_locked;
 	proto_ops->splice_read = psp_splice_read;
