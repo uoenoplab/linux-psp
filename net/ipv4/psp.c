@@ -7,6 +7,8 @@
 #include <linux/sched/signal.h>
 #include <linux/inetdevice.h>
 #include <linux/inet_diag.h>
+#include <net/strparser.h>
+#include <linux/skmsg.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <crypto/aead.h>
@@ -37,30 +39,179 @@ static ssize_t psp_splice_read(struct socket *sock, loff_t *ppos, struct pipe_in
 	return rc;
 }
 
+static void psp_queue(struct strparser *strp, struct sk_buff *skb){
+	printk(KERN_INFO "PSP: psp-queue");
+	struct psp_ctx *psp_ctx = psp_get_ctx(strp->sk);
+	struct psp_crypto_ctx *ctx = psp_ctx->crypto_ctx_recv;
+	ctx->recv_pkt = skb;
+	strp_pause(strp);
+}
+
+static int psp_read_size(struct strparser *strp, struct sk_buff *skb){
+	printk(KERN_INFO "PSP: psp_read_size");
+	struct psp_ctx *psp_ctx = psp_get_ctx(strp->sk);
+	struct psp_crypto_ctx *ctx = psp_ctx->crypto_ctx_recv;
+	char header[32];
+	struct strp_msg *rxm = strp_msg(skb);
+
+	int ret = skb_copy_bits(skb, rxm->offset, header, 32);
+
+	if (ret < 0){
+		strp->sk->sk_err = -ret;
+		sk_error_report(strp->sk);
+		return ret;
+	}
+
+	size_t data_len = (size_t) header[3];
+	
+	return data_len + 32;
+
+}
+
 static int psp_setsockopt(struct sock *sk, int level, int optname, sockptr_t optval, unsigned int optlen){
+	printk(KERN_INFO "PSP: psp_setsockopt");
 	// return code
 	int rc = 0;
 	struct psp_ctx *ctx = psp_get_ctx(sk);
 	struct psp_crypto_info *crypto_info;
+	struct psp_crypto_ctx *crypto_ctx_send;
+	struct psp_crypto_ctx *crypto_ctx_recv;
+	struct crypto_aead **aead;
+	struct crypto_tfm  *tfm;
+	struct strp_callbacks cb;
+	char *iv, *rec_seq, *key, *salt, *cipher_name;
 	printk(KERN_INFO "PSP: setting socket option\n");
 
-	struct psp_crypto_info *crypto_info;
 	if (level != SOL_PSP){
 		return ctx->proto->setsockopt(sk, level, optname, optval, optlen);
 	}
 
+	if (!ctx){
+		return -EINVAL;
+	}
+
+	lock_sock(sk);
+	printk(KERN_INFO "locked sock");
+
+	if (sockptr_is_null(optval) || optlen < sizeof(*crypto_info)){
+		rc = -EINVAL;
+		goto fail;
+	}
+	crypto_info = kzalloc(sizeof(*crypto_info), GFP_KERNEL);
+	rc = copy_from_sockptr(crypto_info, optval, sizeof(*crypto_info));
+	printk(KERN_INFO "copied something to %p from %p", &crypto_info, optval);
+	printk(KERN_INFO "crypto_info: %s", crypto_info->iv);
+	if (rc){
+		rc = -EFAULT;
+		goto fail;
+	}
+
+	rc = copy_from_sockptr_offset(crypto_info + 1, optval, sizeof(*crypto_info), optlen - sizeof(*crypto_info));
+
+	if (rc){
+		rc = -EFAULT;
+		goto fail;
+	}
+
+	if (optname == PSP_TX){
+		if (!ctx->crypto_ctx_send){
+			crypto_ctx_send = kzalloc(sizeof(*crypto_ctx_send), GFP_KERNEL);
+			if (!crypto_ctx_send){
+				rc = -ENOMEM;
+				goto fail;
+			}
+			ctx->crypto_ctx_send = crypto_ctx_send;
+		} else {
+			crypto_ctx_send = (struct psp_crypto_ctx *) ctx->crypto_ctx_send;
+		}
+	} else if (optname == PSP_RX){
+		if (!ctx->crypto_ctx_recv){
+			crypto_ctx_recv = kzalloc(sizeof(*crypto_ctx_recv), GFP_KERNEL);
+			if (!crypto_ctx_recv){
+				rc = -ENOMEM;
+				goto fail;
+			}
+			ctx->crypto_ctx_recv = crypto_ctx_recv;
+		} else {
+			crypto_ctx_recv = (struct psp_crypto_ctx *) ctx->crypto_ctx_recv;
+		}
+	} else {
+		rc = -EINVAL;
+		goto fail;
+	}
+
+	if (optname == PSP_TX){
+		crypto_init_wait(&crypto_ctx_send->async_wait);
+		spin_lock_init(&crypto_ctx_send->compl_lock);
+		aead = &crypto_ctx_send->aead;
+		crypto_ctx_send->info = crypto_info;
+		
+	} else {
+		crypto_init_wait(&crypto_ctx_recv->async_wait);
+		spin_lock_init(&crypto_ctx_recv->compl_lock);
+		aead = &crypto_ctx_recv->aead;
+		crypto_ctx_recv->info = crypto_info;
+	}
+
+
+	printk(KERN_INFO "psp: iv = %s \n", crypto_info->iv);
 	
-	
+	if (!*aead){
+		*aead = crypto_alloc_aead("gcm(aes)",0,0);
+		if (IS_ERR(*aead)){
+			rc = PTR_ERR(*aead);
+			*aead = NULL;
+			printk(KERN_ALERT "error allocating aead");
+			goto fail;
+		}
+		if (optname == PSP_TX){
+			crypto_ctx_send->aead = *aead;
+		} else {
+			crypto_ctx_recv->aead = *aead;
+		}
+	}
+
+	rc = crypto_aead_setkey(*aead, crypto_info->key, 16);
+	if (rc){
+		goto free_aead;
+	}
+
+	rc = crypto_aead_setauthsize(*aead, 16);
+	if (rc){
+		goto free_aead;
+	}
+
+	printk(KERN_INFO "psp: aead = %p", *aead);
+
+	if(crypto_ctx_recv){
+		tfm = crypto_aead_tfm(crypto_ctx_recv->aead);
+		memset(&cb, 0, sizeof(cb));
+		cb.rcv_msg = psp_queue;
+		cb.parse_msg = psp_read_size;
+		//strp_init(&crypto_ctx_recv->strp, sk, &cb);
+	}
+	release_sock(sk);
+	printk(KERN_INFO "PSP: psp_setsockopt fini");
 	return rc;
+
+	fail:
+		release_sock(sk);
+		printk(KERN_INFO "PSP: psp_setsockopt fini");
+		return rc;
+	free_aead:
+		crypto_free_aead(*aead);
+		*aead = NULL;
+		printk(KERN_INFO "PSP: psp_setsockopt fini");
+		return rc;
 }
 
 static int psp_getsockopt(struct sock *sk, int level, int optname, char __user *optval, int __user *optlen){
 	// return code
 	int rc = 0;
-	if ()
-	switch (optname) {
-		case 
-	}
+	//if ()
+	//switch (optname) {
+	//	case 
+	//}
 	printk(KERN_INFO "PSP: getting socket option\n");
 	return rc;
 }
@@ -69,14 +220,36 @@ static void psp_close(struct sock *sk, long timeout){
 	printk(KERN_INFO "PSP: closing\n");
 }
 
+//static struct sk_buff psp_make_skbuff(struct msghdr *msg, size_t size){
+//	struct sk_buff *skb;
+//
+//}
+
 static int psp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size){
+	printk(KERN_INFO "PSP: psp_sendmsg");
 	// return code
 	int rc = 0;
 	struct psp_ctx *ctx;
+	struct crypto_aead *tfm;
+	struct aead_request *req;
 	ctx = psp_get_ctx(sk);
-	printk(KERN_INFO "PSP: sending message %s \n", ctx->udp_psp_hdr);
-	printk(KERN_INFO "PSP: sending message\n");
 
+	tfm = ctx->crypto_ctx_send->aead;
+	req = aead_request_alloc(tfm, GFP_KERNEL);
+	if (!req){
+		rc = -ENOMEM;	
+	}
+	printk(KERN_INFO "PSP: message size %d\n", msg->msg_iter.iov->iov_len);
+	printk(KERN_INFO "PSP: sending message %s \n", msg->msg_iter.iov->iov_base);
+	
+
+	//struct sk_buff *pkt;
+	
+	rc = tcp_sendmsg(sk, msg, size);
+	printk(KERN_INFO "PSP: sent tcp message");
+	if (req != NULL) {
+        aead_request_free(req);
+    }
 	return rc;
 }
 
@@ -90,6 +263,14 @@ static int psp_sendpage(struct sock *sk, struct page *page, int offset, size_t s
 static int psp_recvmsg(struct sock *sk, struct msghdr *msg, size_t size, int noblock, int flags, int *addr_len){
 	// return code
 	int rc = 0;
+	struct psp_ctx *psp_ctx = psp_get_ctx(sk);
+	struct psp_crypto_ctx *ctx = psp_ctx->crypto_ctx_recv;
+	char *data;
+	
+	//memcpy(data, msg->msg_iov->iov_base, msg->msg_iov->iov_len);
+
+	printk(KERN_INFO "PSP: receiving message %s \n", *data);
+	
 	printk(KERN_INFO "PSP: receiving message\n");
 	return rc;
 }
@@ -146,13 +327,12 @@ static const struct snmp_mib psp_mib_list[] = {
 struct psp_ctx *psp_ctx_create(struct sock *sk){
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct psp_ctx *ctx;
-	ctx = kzalloc(sizeof(*ctx), GFP_ATOMIC);
+	ctx = kzalloc(sizeof(struct psp_ctx), GFP_ATOMIC);
 	if (!ctx){
 		return NULL;
 	}
 	rcu_assign_pointer(icsk->icsk_ulp_data, ctx);
 	ctx->sk = sk;
-	ctx->proto = sk->sk_prot;
 	return ctx;
 };
 
@@ -161,33 +341,39 @@ static int psp_init(struct sock *sk){
 	int rc = 0;
 	struct psp_ctx *ctx;
 
-	// using ulp only works in an established state
-	if (sk->sk_state != TCP_ESTABLISHED){
-		return -ENOTCONN;
-	}
-
-
 	// replace proto methods with psp specific methods
 	struct proto *prot = READ_ONCE(sk->sk_prot);
+	struct proto *new_prot;
 	struct proto_ops *proto_ops = READ_ONCE(sk->sk_socket->ops);
+	struct proto_ops *ops;
 
+	new_prot = kzalloc(sizeof(struct proto), GFP_KERNEL);
+	ops = kzalloc(sizeof(struct proto_ops), GFP_KERNEL);
+
+	memcpy(ops, proto_ops, sizeof(struct proto_ops));
+	memcpy(new_prot, prot, sizeof(struct proto));
 	// make context before setting new function pointers
 	ctx = psp_ctx_create(sk);
+	printk(KERN_INFO "PSP: returned from psp-ctx-create");
+	ctx->proto = prot;
+	printk(KERN_INFO "PSP: assigned prot");
+	ops->sendpage_locked = psp_sendpage_locked;
+	ops->splice_read = psp_splice_read;
+	new_prot->setsockopt = psp_setsockopt;
+	new_prot->getsockopt = psp_getsockopt;
+	new_prot->close = psp_close;
+	new_prot->sendmsg = psp_sendmsg;
+	new_prot->recvmsg = psp_recvmsg;
+	new_prot->connect = tcp_v4_connect;
 
-	proto_ops->sendpage_locked = psp_sendpage_locked;
-	proto_ops->splice_read = psp_splice_read;
-	
-	prot->setsockopt = psp_setsockopt;
-	prot->getsockopt = psp_getsockopt;
-	prot->close = psp_close;
-	prot->sendmsg = psp_sendmsg;
-	prot->sendpage = psp_sendpage;
-	prot->recvmsg = psp_recvmsg;
-	prot->sock_is_readable = psp_sock_is_readable;
+	printk(KERN_INFO "PSP: connect function pointer - %s", prot->connect);
 
-	WRITE_ONCE(sk->sk_prot, prot);
-	WRITE_ONCE(sk->sk_socket->ops, proto_ops);
+	printk(KERN_INFO "PSP: reassigned function pointers");
 
+	WRITE_ONCE(sk->sk_prot, new_prot);
+	printk(KERN_INFO "PSP: wrote prot");
+	WRITE_ONCE(sk->sk_socket->ops, ops);
+	printk(KERN_INFO "PSP: wrote proto_ops");
 	// might need to create context
 
 	// not supporting ipv6
@@ -196,7 +382,7 @@ static int psp_init(struct sock *sk){
 	}
 
 	printk(KERN_INFO "PSP: initialised PSP protocol\n");
-
+	printk(KERN_INFO "PSP: return code %d\n", rc);
 	return rc;
 }
 
@@ -261,14 +447,14 @@ static int __init psp_register(void){
 		return err;
 	}
 	tcp_register_ulp(&tcp_psp_ulp_ops);
-	printk(KERN_INFO "PSP: Registered PSP protocol\n");
+	printk(KERN_INFO "psp_register\n");
 	return 0;
 }
 
 static void __exit psp_unregister(void){
 	tcp_unregister_ulp(&tcp_psp_ulp_ops);
 	unregister_pernet_subsys(&psp_net_ops);
-	printk(KERN_INFO "PSP: Unregistered PSP protocol\n");
+	printk(KERN_INFO "psp_unregister\n");
 }
 
 module_init(psp_register);
