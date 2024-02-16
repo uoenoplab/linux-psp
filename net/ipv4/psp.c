@@ -1,7 +1,9 @@
 #include <linux/module.h>
 
 #include <net/tcp.h>
+#include <uapi/linux/udp.h>
 #include <net/inet_common.h>
+#include <linux/scatterlist.h>
 #include <linux/highmem.h>
 #include <linux/netdevice.h>
 #include <linux/sched/signal.h>
@@ -12,6 +14,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <crypto/aead.h>
+#include <linux/ctype.h>
 #include "psp.h"
 
 
@@ -225,31 +228,163 @@ static void psp_close(struct sock *sk, long timeout){
 //
 //}
 
+static void psp_make_msg(struct psp_data *data, void* msg){
+	pr_info("PSP: making msg");
+	pr_info("PSP: msg allocated %d\n", data->udp_hdr->len);
+	memcpy(msg, (char *)data->udp_hdr, sizeof(struct udphdr));\
+	msg += sizeof(struct udphdr);
+	pr_info("PSP: udp header copied - %s", (char *)msg);
+	memcpy(msg, (char *) data->psp_hdr, sizeof(struct psp_hdr));
+	msg += sizeof(struct psp_hdr);
+	memcpy(msg, data->data, data->data_size);
+}
+
+static void print_psp_header(struct psp_hdr *hdr){
+	printk(KERN_INFO "PSP: next_header - %d", hdr->next_header);
+	printk(KERN_INFO "PSP: hdr_ext_len - %d", hdr->hdr_ext_len);
+	printk(KERN_INFO "PSP: R - %d", hdr->R);
+	printk(KERN_INFO "PSP: crypt_offset - %d", hdr->crypt_offset);
+	printk(KERN_INFO "PSP: S - %d", hdr->S);
+	printk(KERN_INFO "PSP: D - %d", hdr->D);
+	printk(KERN_INFO "PSP: version - %d", hdr->version);
+	printk(KERN_INFO "PSP: V - %d", hdr->V);
+	printk(KERN_INFO "PSP: one - %d", hdr->one);
+	printk(KERN_INFO "PSP: SPI - %s", hdr->SPI);
+	printk(KERN_INFO "PSP: IV - %s", hdr->IV);
+	printk(KERN_INFO "PSP: VC - %d", hdr->VC);
+}
+
+static void print_udp_header(struct udphdr *hdr){
+	printk(KERN_INFO "PSP: source - %d", hdr->source);
+	printk(KERN_INFO "PSP: dest - %d", hdr->dest);
+	printk(KERN_INFO "PSP: len - %d", hdr->len);
+	printk(KERN_INFO "PSP: check - %d", hdr->check);
+}
+
+static void print_psp_data(struct psp_data *data){
+	print_psp_header(data->psp_hdr);
+	print_udp_header(data->udp_hdr);
+	printk(KERN_INFO "PSP: data - %p", *(data->data));
+	printk(KERN_INFO "PSP: data_size - %d", data->data_size);
+}
+
+static struct psp_hdr* psp_make_header(struct psp_ctx *ctx){
+	struct psp_hdr *hdr = kzalloc(sizeof(struct psp_hdr), GFP_KERNEL);
+	hdr->next_header = (u8) ctx->sk->sk_protocol;
+	hdr->hdr_ext_len = 0;
+	hdr->R = 0;
+	hdr->crypt_offset = 0;
+	hdr->S = 0;
+	hdr->D = 0;
+	hdr->version = 0;
+	hdr->V = 0;
+	hdr->one = 1;
+	memcpy(hdr->SPI, ctx->crypto_ctx_send->info->spi, 2);
+	memcpy(hdr->IV, ctx->crypto_ctx_send->info->iv, 4);
+	hdr->VC = 0;
+	pr_info("%s", hdr->SPI);
+	return hdr;
+}
+
+static struct udphdr* psp_make_udp_header(int size, int icv_size){
+	struct udphdr *hdr = kzalloc(sizeof(struct udphdr), GFP_KERNEL);
+	hdr->source = 0;
+	hdr->dest = 1000;
+	hdr->len = sizeof(struct psp_hdr) + sizeof(struct udphdr) + size + icv_size;
+	hdr->check = 0;
+	return hdr;
+}
+
+
 static int psp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size){
 	printk(KERN_INFO "PSP: psp_sendmsg");
 	// return code
 	int rc = 0;
+	// define structs we need
 	struct psp_ctx *ctx;
 	struct crypto_aead *tfm;
 	struct aead_request *req;
+	struct scatterlist sg = { 0 };
+	u8 *buffer = NULL;
+	u8 buffersize;
+	struct udphdr *udp_header;
+	struct psp_hdr *psp_header;
+	struct iov_iter *msg_iter;
+	char *icv;
+	const int icv_size = 16;
+
+	// declare wait for async crypto
+	// TODO: check if this can be removed
+	DECLARE_CRYPTO_WAIT(wait);
+	// get context
 	ctx = psp_get_ctx(sk);
+	// allocate memory for headers/trailers
+	udp_header = psp_make_udp_header(size, icv_size);
+	psp_header = psp_make_header(ctx);
+	pr_info("psp hdr spi: %s", (char *) psp_header);
+
+	pr_info("PSP: set headers");
 
 	tfm = ctx->crypto_ctx_send->aead;
 	req = aead_request_alloc(tfm, GFP_KERNEL);
 	if (!req){
 		rc = -ENOMEM;	
 	}
-	printk(KERN_INFO "PSP: message size %d\n", msg->msg_iter.iov->iov_len);
-	printk(KERN_INFO "PSP: sending message %s \n", msg->msg_iter.iov->iov_base);
-	
 
-	//struct sk_buff *pkt;
-	
+	buffersize = size + 16;
+	buffer = kzalloc(buffersize, GFP_KERNEL);
+
+	if (buffer == NULL){
+		pr_err("PSP: failed kzalloc for msg");
+		return -ENOMEM;
+	}
+
+	memcpy(buffer, msg->msg_iter.iov->iov_base, size);
+	sg_init_one(&sg, buffer, buffersize);
+	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | 
+				       CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
+
+	aead_request_set_crypt(req, &sg, &sg, buffersize - 16, ctx->crypto_ctx_send->info->iv);
+	rc = crypto_wait_req(crypto_aead_encrypt(req), &wait);
+
+	if (rc != 0){
+		pr_err("PSP: error encrypting data for sendmsg()");
+	}
+	pr_info("PSP: did encryption");
+	//struct psp_data *data = kzalloc(sizeof(struct psp_data), GFP_KERNEL);
+	//data->udp_hdr = udp_header;
+	//data->psp_hdr = psp_header;
+	//data->data = kzalloc(buffersize, GFP_KERNEL);
+	//data->data_size = buffersize;
+	//memcpy(data->data, buffer, buffersize);
+	//print_psp_data(data);
+
+	char *msg_buf = kzalloc(udp_header->len, GFP_KERNEL);
+	//psp_make_msg(data, msg_buf);
+	memcpy(msg_buf, udp_header, sizeof(struct udphdr));
+	msg_buf += sizeof(struct udphdr);
+	memcpy(msg_buf, psp_header, sizeof(struct psp_hdr));
+	msg_buf += sizeof(struct psp_hdr);
+	memcpy(msg_buf, buffer, buffersize);
+	pr_info("PSP: message : %s", buffer);
+	pr_info("PSP: made message : %s", msg_buf);
+
+	struct iovec iov = {};
+	struct msghdr newmsg = {};
+
+	iov.iov_base = msg_buf;
+	iov.iov_len = udp_header->len;
+
+	iov_iter_init(&newmsg.msg_iter, READ, &iov, 1, udp_header->len);
+
+	printk(KERN_INFO "PSP: sending message - %s\n", msg->msg_iter.iov->iov_base);
+	rc = tcp_sendmsg(sk, &newmsg, udp_header->len);
+	printk(KERN_INFO "PSP: sent tcp message %d", rc);
 	rc = tcp_sendmsg(sk, msg, size);
-	printk(KERN_INFO "PSP: sent tcp message");
+	printk(KERN_INFO "PSP: sent tcp message %d", rc);	
 	if (req != NULL) {
-        aead_request_free(req);
-    }
+		aead_request_free(req);
+    	}
 	return rc;
 }
 

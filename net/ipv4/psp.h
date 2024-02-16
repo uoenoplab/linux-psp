@@ -38,7 +38,8 @@ struct psp_ctx {
 struct psp_data {
 	struct udphdr		*udp_hdr;
 	struct psp_hdr		*psp_hdr;
-	struct psp_trailer	*psp_trailer;
+	char 			*data;
+	int			data_size;
 };
 
 struct psp_hdr {
@@ -51,13 +52,9 @@ struct psp_hdr {
 			version:4,
 			V:1,	/* Virtualisation Cookie Present bit */
 			one:1;	/* always set to 1 */
-	__be32		SPI;	/* Security Parameters Index */
-	__be64		IV; 	/* Initialisation Vector */
+	unsigned char	SPI[4];	/* Security Parameters Index */
+	unsigned char	IV[8]; 	/* Initialisation Vector */
 	__be64		VC;	/* Virtualisation Cookie (only present if V is set) */
-};
-
-struct psp_trailer {
-	uint64_t	ICV[2];	/* Integrity Checksum Value */
 };
 
 static inline struct psp_ctx *psp_get_ctx(const struct sock *sk){
