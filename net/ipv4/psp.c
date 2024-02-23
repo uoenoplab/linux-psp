@@ -223,21 +223,7 @@ static void psp_close(struct sock *sk, long timeout){
 	printk(KERN_INFO "PSP: closing\n");
 }
 
-//static struct sk_buff psp_make_skbuff(struct msghdr *msg, size_t size){
-//	struct sk_buff *skb;
-//
-//}
 
-static void psp_make_msg(struct psp_data *data, void* msg){
-	pr_info("PSP: making msg");
-	pr_info("PSP: msg allocated %d\n", data->udp_hdr->len);
-	memcpy(msg, (char *)data->udp_hdr, sizeof(struct udphdr));\
-	msg += sizeof(struct udphdr);
-	pr_info("PSP: udp header copied - %s", (char *)msg);
-	memcpy(msg, (char *) data->psp_hdr, sizeof(struct psp_hdr));
-	msg += sizeof(struct psp_hdr);
-	memcpy(msg, data->data, data->data_size);
-}
 
 static void print_psp_header(struct psp_hdr *hdr){
 	printk(KERN_INFO "PSP: next_header - %d", hdr->next_header);
@@ -282,7 +268,6 @@ static struct psp_hdr* psp_make_header(struct psp_ctx *ctx){
 	memcpy(hdr->SPI, ctx->crypto_ctx_send->info->spi, 2);
 	memcpy(hdr->IV, ctx->crypto_ctx_send->info->iv, 4);
 	hdr->VC = 0;
-	pr_info("%s", hdr->SPI);
 	return hdr;
 }
 
@@ -321,7 +306,7 @@ static int psp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size){
 	// allocate memory for headers/trailers
 	udp_header = psp_make_udp_header(size, icv_size);
 	psp_header = psp_make_header(ctx);
-	pr_info("psp hdr spi: %s", (char *) psp_header);
+	pr_info("psp hdr spi: %d", psp_header->next_header);
 
 	pr_info("PSP: set headers");
 
@@ -351,40 +336,42 @@ static int psp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size){
 		pr_err("PSP: error encrypting data for sendmsg()");
 	}
 	pr_info("PSP: did encryption");
-	//struct psp_data *data = kzalloc(sizeof(struct psp_data), GFP_KERNEL);
-	//data->udp_hdr = udp_header;
-	//data->psp_hdr = psp_header;
-	//data->data = kzalloc(buffersize, GFP_KERNEL);
-	//data->data_size = buffersize;
-	//memcpy(data->data, buffer, buffersize);
-	//print_psp_data(data);
 
-	char *msg_buf = kzalloc(udp_header->len, GFP_KERNEL);
-	//psp_make_msg(data, msg_buf);
-	memcpy(msg_buf, udp_header, sizeof(struct udphdr));
-	msg_buf += sizeof(struct udphdr);
-	memcpy(msg_buf, psp_header, sizeof(struct psp_hdr));
-	msg_buf += sizeof(struct psp_hdr);
-	memcpy(msg_buf, buffer, buffersize);
-	pr_info("PSP: message : %s", buffer);
-	pr_info("PSP: made message : %s", msg_buf);
+	size_t count = udp_header->len;
+	char *finalmsg = kmalloc(count, GFP_KERNEL);
+	struct kvec kvec = {};
 
-	struct iovec iov = {};
-	struct msghdr newmsg = {};
+	char udp_buf[sizeof(struct udphdr)];
+	//printk("udp_header: %", cpy_buf);
+	memcpy(&udp_buf, udp_header, sizeof(struct udphdr));
+	memcpy(finalmsg, &udp_buf, sizeof(struct udphdr));
+	
+	char psp_buf[sizeof(struct psp_hdr)];
+	memcpy(&psp_buf, psp_header, sizeof(struct psp_hdr));
+	memcpy(finalmsg + sizeof(struct udphdr), &psp_buf, sizeof(struct psp_hdr));
+	memcpy(finalmsg + sizeof(struct udphdr) + sizeof(struct psp_hdr), buffer, buffersize);
+	printk("buffer:              %s", buffer);
+	printk("constructed message: %s", finalmsg);
 
-	iov.iov_base = msg_buf;
-	iov.iov_len = udp_header->len;
+	//int i;
+	//for (i = 0; i < count; i++){
+	//	printk("%x", *(finalmsg+i));
+	//}
 
-	iov_iter_init(&newmsg.msg_iter, READ, &iov, 1, udp_header->len);
+	kvec.iov_base = finalmsg;
+	kvec.iov_len = count;
+	iov_iter_kvec(&msg->msg_iter, WRITE, &kvec, 1, count);
 
-	printk(KERN_INFO "PSP: sending message - %s\n", msg->msg_iter.iov->iov_base);
-	rc = tcp_sendmsg(sk, &newmsg, udp_header->len);
+
+	//printk(KERN_INFO "PSP: sending message - %s\n", newmsg.msg_iter.iov->iov_base);
+	rc = tcp_sendmsg(sk, msg, count);
 	printk(KERN_INFO "PSP: sent tcp message %d", rc);
-	rc = tcp_sendmsg(sk, msg, size);
-	printk(KERN_INFO "PSP: sent tcp message %d", rc);	
 	if (req != NULL) {
 		aead_request_free(req);
     	}
+	kfree(buffer);
+	kfree(psp_header);
+	kfree(udp_header);
 	return rc;
 }
 
@@ -400,13 +387,9 @@ static int psp_recvmsg(struct sock *sk, struct msghdr *msg, size_t size, int nob
 	int rc = 0;
 	struct psp_ctx *psp_ctx = psp_get_ctx(sk);
 	struct psp_crypto_ctx *ctx = psp_ctx->crypto_ctx_recv;
-	char *data;
-	
-	//memcpy(data, msg->msg_iov->iov_base, msg->msg_iov->iov_len);
 
-	printk(KERN_INFO "PSP: receiving message %s \n", *data);
-	
-	printk(KERN_INFO "PSP: receiving message\n");
+	tcp_recvmsg(sk, msg, size, noblock, flags, addr_len);
+	printk(KERN_INFO "PSP: received: ", msg->msg_iter.iov);
 	return rc;
 }
 
@@ -492,16 +475,19 @@ static int psp_init(struct sock *sk){
 	printk(KERN_INFO "PSP: returned from psp-ctx-create");
 	ctx->proto = prot;
 	printk(KERN_INFO "PSP: assigned prot");
-	ops->sendpage_locked = psp_sendpage_locked;
-	ops->splice_read = psp_splice_read;
+	//ops->sendpage_locked = psp_sendpage_locked;
+	//ops->splice_read = psp_splice_read;
 	new_prot->setsockopt = psp_setsockopt;
-	new_prot->getsockopt = psp_getsockopt;
-	new_prot->close = psp_close;
+	//new_prot->getsockopt = psp_getsockopt;
+	//new_prot->close = psp_close;
 	new_prot->sendmsg = psp_sendmsg;
 	new_prot->recvmsg = psp_recvmsg;
-	new_prot->connect = tcp_v4_connect;
+	//new_prot->connect = tcp_v4_connect;
 
-	printk(KERN_INFO "PSP: connect function pointer - %s", prot->connect);
+	printk(KERN_INFO "PSP: listen function pointer - %p", ops->listen);
+	ops->listen = inet_listen;
+	printk(KERN_INFO "PSP: listen function pointer - %p", ops->listen);
+	printk(KERN_INFO "PSP: connect function pointer - %p", new_prot->connect);
 
 	printk(KERN_INFO "PSP: reassigned function pointers");
 
