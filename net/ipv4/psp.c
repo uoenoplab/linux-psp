@@ -157,7 +157,7 @@ static int psp_setsockopt(struct sock *sk, int level, int optname, sockptr_t opt
 	}
 
 
-	printk(KERN_INFO "psp: iv = %s \n", crypto_info->iv);
+	//printk(KERN_INFO "psp: iv = %s \n", crypto_info->iv);
 	
 	if (!*aead){
 		*aead = crypto_alloc_aead("gcm(aes)",0,0);
@@ -184,7 +184,7 @@ static int psp_setsockopt(struct sock *sk, int level, int optname, sockptr_t opt
 		goto free_aead;
 	}
 
-	printk(KERN_INFO "psp: aead = %p", *aead);
+	//printk(KERN_INFO "psp: aead = %p", *aead);
 
 	if(crypto_ctx_recv){
 		tfm = crypto_aead_tfm(crypto_ctx_recv->aead);
@@ -297,6 +297,8 @@ static int psp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size){
 	struct iov_iter *msg_iter;
 	char *icv;
 	const int icv_size = 16;
+	
+	//return tcp_sendmsg(sk, msg, size);
 
 	// declare wait for async crypto
 	// TODO: check if this can be removed
@@ -306,9 +308,9 @@ static int psp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size){
 	// allocate memory for headers/trailers
 	udp_header = psp_make_udp_header(size, icv_size);
 	psp_header = psp_make_header(ctx);
-	pr_info("psp hdr spi: %d", psp_header->next_header);
+	//pr_info("psp hdr spi: %d", psp_header->next_header);
 
-	pr_info("PSP: set headers");
+	//pr_info("PSP: set headers");
 
 	tfm = ctx->crypto_ctx_send->aead;
 	req = aead_request_alloc(tfm, GFP_KERNEL);
@@ -324,18 +326,19 @@ static int psp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size){
 		return -ENOMEM;
 	}
 
-	memcpy(buffer, msg->msg_iter.iov->iov_base, size);
+	copy_from_iter(buffer, size, &msg->msg_iter);
+	printk("buffer: %s", buffer);
 	sg_init_one(&sg, buffer, buffersize);
 	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG | 
 				       CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
 
 	aead_request_set_crypt(req, &sg, &sg, buffersize - 16, ctx->crypto_ctx_send->info->iv);
 	rc = crypto_wait_req(crypto_aead_encrypt(req), &wait);
-
+	printk("buffer: %s", buffer);
 	if (rc != 0){
 		pr_err("PSP: error encrypting data for sendmsg()");
 	}
-	pr_info("PSP: did encryption");
+	//pr_info("PSP: did encryption");
 
 	size_t count = udp_header->len;
 	char *finalmsg = kmalloc(count, GFP_KERNEL);
@@ -351,25 +354,25 @@ static int psp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size){
 	memcpy(finalmsg + sizeof(struct udphdr), &psp_buf, sizeof(struct psp_hdr));
 	memcpy(finalmsg + sizeof(struct udphdr) + sizeof(struct psp_hdr), buffer, buffersize);
 	printk("buffer:              %s", buffer);
-	printk("constructed message: %s", finalmsg);
+	printk("constructed message: %x", finalmsg);
 
 	//int i;
 	//for (i = 0; i < count; i++){
 	//	printk("%x", *(finalmsg+i));
 	//}
 
-	kvec.iov_base = finalmsg;
-	kvec.iov_len = count;
-	iov_iter_kvec(&msg->msg_iter, WRITE, &kvec, 1, count);
+	kvec.iov_base = buffer;
+	kvec.iov_len = buffersize;
+	iov_iter_kvec(&msg->msg_iter, WRITE, &kvec, 1, buffersize);
 
-
-	//printk(KERN_INFO "PSP: sending message - %s\n", newmsg.msg_iter.iov->iov_base);
+	//printk(KERN_INFO "PSP: sending message - %s\n", new->msg_iter.iov->iov_base);
 	rc = tcp_sendmsg(sk, msg, count);
-	printk(KERN_INFO "PSP: sent tcp message %d", rc);
+	//printk(KERN_INFO "PSP: sent tcp message %d", rc);
 	if (req != NULL) {
 		aead_request_free(req);
     	}
 	kfree(buffer);
+	//kfree(finalmsg);
 	kfree(psp_header);
 	kfree(udp_header);
 	return rc;
@@ -382,14 +385,52 @@ static int psp_sendpage(struct sock *sk, struct page *page, int offset, size_t s
 	return rc;
 }
 
-static int psp_recvmsg(struct sock *sk, struct msghdr *msg, size_t size, int noblock, int flags, int *addr_len){
-	// return code
-	int rc = 0;
-	struct psp_ctx *psp_ctx = psp_get_ctx(sk);
-	struct psp_crypto_ctx *ctx = psp_ctx->crypto_ctx_recv;
+static struct psp_data *deserialise_header(struct msghdr *msg, size_t size){
+	// allocate buffer and copy from msg
+	u8 *buffer = NULL;
+	buffer = kzalloc(size, GFP_KERNEL);
+	copy_from_iter(buffer, size, &msg->msg_iter);
 
-	tcp_recvmsg(sk, msg, size, noblock, flags, addr_len);
-	printk(KERN_INFO "PSP: received: ", msg->msg_iter.iov);
+	// allocate structures for headers
+	struct psp_hdr *psp_hdr = kzalloc(sizeof(struct psp_hdr), GFP_KERNEL);
+	struct udphdr *udp_hdr = kzalloc(sizeof(struct udphdr), GFP_KERNEL);
+	struct psp_data *psp_data = kzalloc(sizeof(struct psp_data), GFP_KERNEL);
+
+	memcpy(udp_hdr, buffer, sizeof(struct udphdr));
+	memcpy(psp_hdr, buffer + sizeof(struct udphdr), sizeof(struct psp_hdr));
+	memcpy(psp_data->data, 
+		buffer + sizeof(struct udphdr) + sizeof(struct psp_hdr), 
+		size - sizeof(struct udphdr) - sizeof(struct psp_hdr));
+	psp_data->psp_hdr = psp_hdr;
+	psp_data->udp_hdr = udp_hdr;
+	psp_data->data_size = size - sizeof(struct udphdr) - sizeof(struct psp_hdr);
+	return psp_data;
+}
+
+static int psp_recvmsg(struct sock *sk, struct msghdr *msg, size_t size, int noblock, int flags, int *addr_len){
+	
+	int rc;
+
+	struct msghdr recv_msg;
+	struct kvec iov;
+	u8 *buffer = NULL;
+	buffer = kzalloc(size, GFP_KERNEL);
+	if (buffer == NULL){
+		printk(KERN_INFO "PSP: failed kzalloc for msg");
+		return -ENOMEM;
+	}
+
+	iov.iov_base = buffer;
+	iov.iov_len = size;
+	iov_iter_kvec(&recv_msg.msg_iter, READ, &iov, 1, size);
+
+	rc = tcp_recvmsg(sk, &recv_msg, size, noblock, flags, addr_len);
+	
+	if (rc > 0){
+		printk("message size after recv: %d", rc);
+		printk(KERN_INFO "Received data: %.*s\n", rc, buffer);
+	}
+	kfree(buffer);
 	return rc;
 }
 
@@ -521,6 +562,13 @@ static int psp_stats_show(struct seq_file *seq, void *v){
 	return 0;
 }
 
+static void psp_clone(const struct request_sock *req, struct sock *newsk, const gfp_t priority)
+{
+	
+	/* Copy any PSP-specific data from the original sock to the clone */
+	// TODO: Add code to copy PSP-specific data
+}
+
 int __net_init psp_proc_init(struct net *net){
 	if(!proc_create_net_single("PSP_stat", 0444, net->proc_net, psp_stats_show, NULL)){
 		return -ENOMEM;
@@ -555,9 +603,10 @@ static struct tcp_ulp_ops tcp_psp_ulp_ops = {
 	.name = "PSP",
 	.owner = THIS_MODULE,
 	.init = psp_init,
-	.update = psp_update,
-	.get_info = psp_get_info,
-	.get_info_size = psp_get_info_size,
+	//.update = psp_update,
+	//.get_info = psp_get_info,
+	//.get_info_size = psp_get_info_size,
+	.clone = psp_clone,
 };
 
 static int __init psp_register(void){
