@@ -13,6 +13,7 @@ enum {
 	FOU_ENCAP_UNSPEC,
 	FOU_ENCAP_DIRECT,
 	FOU_ENCAP_GUE,
+	FOU_ENCAP_PSP,
 };
 
 enum {

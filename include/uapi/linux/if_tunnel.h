@@ -86,6 +86,7 @@ enum tunnel_encap_types {
 	TUNNEL_ENCAP_FOU,
 	TUNNEL_ENCAP_GUE,
 	TUNNEL_ENCAP_MPLS,
+	TUNNEL_ENCAP_PSP,
 };
 
 #define TUNNEL_ENCAP_FLAG_CSUM		(1<<0)
