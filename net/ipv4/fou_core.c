@@ -12,12 +12,18 @@
 #include <net/gro.h>
 #include <net/gue.h>
 #include <net/fou.h>
+#include <net/psp.h>
 #include <net/ip.h>
 #include <net/protocol.h>
 #include <net/udp.h>
 #include <net/udp_tunnel.h>
 #include <uapi/linux/fou.h>
 #include <uapi/linux/genetlink.h>
+
+// for psp crypto
+#include <linux/crypto.h>
+#include <crypto/internal/aead.h>
+#include <linux/scatterlist.h>
 
 #include "fou_nl.h"
 
@@ -225,6 +231,126 @@ static int gue_udp_recv(struct sock *sk, struct sk_buff *skb)
 
 drop:
 	kfree_skb(skb);
+	return 0;
+}
+
+static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
+	struct fou *fou = fou_from_sock(sk);
+	size_t len, optlen, hdrlen;
+	struct psphdr *psphdr;
+	struct crypto_aead *tfm = NULL;
+	struct aead_request *req = NULL;
+	void *decrypt_buf;
+	size_t decrypt_len;
+	struct scatterlist sg = { 0 };
+	void *data;
+	int err = -1;
+	
+	DECLARE_CRYPTO_WAIT(wait);
+
+	printk("PSP UDP RECV\n");
+
+	// need to work out how to get this
+	u8 key[32] = { 0 };
+
+	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+
+	if (IS_ERR(tfm)) {
+		err = PTR_ERR(tfm);
+		pr_err("PSP: crypto_alloc_aead() has failed: %d.\n", err);
+		return err;
+    	}
+
+	err = crypto_aead_setauthsize(tfm, PSP_AES_TAG_SIZE);
+	if (err != 0) {
+		pr_err("PSP: crypto_aead_setauthsize() has failed: %d.\n", err);
+		crypto_free_aead(tfm);
+		return err;
+	}
+
+	decrypt_len = udp_hdr(skb)->len;
+	decrypt_buf = kmalloc(decrypt_len, GFP_KERNEL);
+	if (decrypt_buf == NULL){
+		err = -ENOMEM;
+		pr_err("PSP: kmalloc() has failed: %d.\n", err);
+		crypto_free_aead(tfm);
+		return err;
+	}
+
+	if (!fou)
+		return 1;
+	len = sizeof(struct udphdr) + sizeof(struct psphdr);
+
+	if (!pskb_may_pull(skb, len))
+		goto drop;
+	
+	psphdr = (struct psphdr *)&udp_hdr(skb)[1];
+
+	if (fou->family == AF_INET)
+		ip_hdr(skb)->tot_len = htons(ntohs(ip_hdr(skb)->tot_len) - len);
+	else
+		goto drop;
+
+	if (psphdr->version != 0)
+		goto drop;
+	
+	if (psphdr->crypt_offset > skb->len)
+		goto drop;
+
+	data = &psphdr[1];
+
+	memcpy(decrypt_buf, data, decrypt_len);
+	sg_init_one(&sg, decrypt_buf, decrypt_len);
+	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
+				CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
+	
+	aead_request_set_crypt(req, &sg, &sg, decrypt_len, psphdr->iv);
+
+	err = crypto_aead_setkey(tfm, key, sizeof(key));
+	if (err != 0) {
+        	pr_err("PSP: crypto_aead_setkey() has failed: %d.\n", err);
+        	return err;
+	}
+
+	err = crypto_wait_req(crypto_aead_decrypt(req), &wait);
+    	if (err != 0) {
+        	pr_err("PSP: Error when decrypting data, it seems tampered. "
+               "Ask for a retransmission or verify your key.\n");
+        	return err;
+	}
+
+	memcpy(data, decrypt_buf, decrypt_len - PSP_AES_TAG_SIZE);
+
+	skb_trim(skb, decrypt_len - PSP_AES_TAG_SIZE);
+	__skb_pull(skb, len);
+
+	skb_reset_transport_header(skb);
+
+	return -psphdr->next_header;
+
+	drop:
+		kfree_skb(skb);
+		return 0;
+	
+}
+
+static struct psphdr *psp_remcsum(struct sk_buff *skb, struct guehdr *guehdr, void *data, size_t hdrlen, u8 ipproto, bool nopartial){
+	printk("PSP REMCSUM\n");
+	return NULL;
+}
+
+static struct guehdr *psp_gro_remcsum(struct sk_buff *skb, unsigned int off, struct guehdr *guehdr, void *data, size_t hdrlen, struct gro_remcsum *grc, bool nopartial){
+	printk("PSP GRO REMCSUM\n");
+	return NULL;
+}
+
+static struct sk_buff *psp_gro_receive(struct sock *sk, struct list_head *head, struct sk_buff *skb){
+	printk("PSP GRO RECEIVE\n");
+	return NULL;
+}
+
+static int psp_gro_complete(struct sock *sk, struct sk_buff *skb, int nhoff){
+	printk("PSP GRO COMPLETE\n");
 	return 0;
 }
 
@@ -594,6 +720,12 @@ static int fou_create(struct net *net, struct fou_cfg *cfg,
 		tunnel_cfg.encap_rcv = gue_udp_recv;
 		tunnel_cfg.gro_receive = gue_gro_receive;
 		tunnel_cfg.gro_complete = gue_gro_complete;
+		break;
+	case FOU_ENCAP_PSP:
+		printk("PSP\n");
+		tunnel_cfg.encap_rcv = psp_udp_recv;
+		tunnel_cfg.gro_receive = psp_gro_receive;
+		tunnel_cfg.gro_complete = psp_gro_complete;
 		break;
 	default:
 		err = -EINVAL;
@@ -1144,6 +1276,178 @@ out:
 	return ret;
 }
 
+// stolen from https://olegkutkov.me/2019/10/17/printing-sk_buff-data/
+void pkt_hex_dump(struct sk_buff *skb)
+{
+    size_t len;
+    int rowsize = 16;
+    int i, l, linelen, remaining;
+    int li = 0;
+    uint8_t *data, ch; 
+
+    printk("Packet hex dump:\n");
+    data = (uint8_t *) skb_mac_header(skb);
+
+    if (skb_is_nonlinear(skb)) {
+        len = skb->data_len;
+    } else {
+        len = skb->len;
+    }
+
+    remaining = len;
+    for (i = 0; i < len; i += rowsize) {
+        printk("%06d\t", li);
+
+        linelen = min(remaining, rowsize);
+        remaining -= rowsize;
+
+        for (l = 0; l < linelen; l++) {
+            ch = data[l];
+            printk(KERN_CONT "%02X ", (uint32_t) ch);
+        }
+
+        data += linelen;
+        li += 10; 
+
+        printk(KERN_CONT "\n");
+    }
+}
+
+size_t psp_encap_hlen(struct ip_tunnel_encap *e){
+	printk("psp_encap_hlen\n");
+	printk("returned: %lu\n", sizeof(struct udphdr) + sizeof(struct psphdr));
+	return sizeof(struct udphdr) + sizeof(struct psphdr);
+}
+
+int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *protocol, __be16 *sport, int type){
+	printk("__psp_build_header\n");
+	struct psphdr *psphdr;
+	size_t hdrlen;
+	struct crypto_aead *tfm = NULL;
+	struct aead_request *req = NULL;
+	void *encrypt_buf;
+	size_t encrypt_len;
+	struct scatterlist sg = { 0 };
+	int err;
+	__be64 iv;
+
+	iv = cpu_to_be64(skb_get_ktime(skb));
+	DECLARE_CRYPTO_WAIT(wait);
+
+	// need to work out how to get this
+	u8 key[32] = { 0 };
+
+	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+
+	if (IS_ERR(tfm)) {
+		err = PTR_ERR(tfm);
+		pr_err("PSP: crypto_alloc_aead() has failed: %d.\n", err);
+		return err;
+    	}
+
+	err = crypto_aead_setauthsize(tfm, PSP_AES_TAG_SIZE);
+	if (err != 0) {
+		pr_err("PSP: crypto_aead_setauthsize() has failed: %d.\n", err);
+		crypto_free_aead(tfm);
+		return err;
+	}
+
+	encrypt_len = skb->len + PSP_AES_TAG_SIZE;
+	encrypt_buf = kmalloc(encrypt_len, GFP_KERNEL);
+	if (!encrypt_buf) {
+		pr_err("PSP: kmalloc() has failed.\n");
+		crypto_free_aead(tfm);
+		return -ENOMEM;
+	}
+
+	memcpy(encrypt_buf, skb->data, skb->len);
+	sg_init_one(&sg, encrypt_buf, encrypt_len);
+	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
+				CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
+
+	aead_request_set_crypt(req, &sg, &sg, skb->len, iv);
+
+	err = crypto_wait_req(crypto_aead_encrypt(req), &wait);
+	if (err) {
+		pr_err("PSP: crypto_aead_encrypt() has failed: %d.\n", err);
+		kfree(encrypt_buf);
+		crypto_free_aead(tfm);
+		return err;
+	}
+
+	// need to encrypt the data before pushing the header
+	skb_put(skb, PSP_AES_TAG_SIZE);
+	memcpy(skb->data, encrypt_buf, encrypt_len);
+
+	err = iptunnel_handle_offloads(skb, type);
+	if (err)
+		return err;
+
+	//pkt_hex_dump(skb);
+
+	*sport = e->sport ? : udp_flow_src_port(dev_net(skb->dev),
+						skb, 0, 0, false);
+	
+	hdrlen = sizeof(struct psphdr);
+	
+	skb_push(skb, hdrlen);
+	psphdr = (struct psphdr *)skb->data;
+	psphdr->version = 0;
+	psphdr->header_ext_len = 0;
+	psphdr->next_header = *protocol;
+	psphdr->r = 0;
+	psphdr->s = 0;
+	psphdr->d = 0;
+	psphdr->v = 0;
+	psphdr->one = 1;
+	psphdr->iv = iv;
+	psphdr->spi = 1234;
+	psphdr->vc = 0;
+	psphdr->crypt_offset = 0;
+
+	printk("__psp_build_header fini\n");
+	return 0;
+}
+
+int psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *protocol, struct flowi4 *fl4){
+	printk("psp_build_header\n");
+
+	__be16 sport;
+	int err;
+
+	err = __psp_build_header(skb, e, protocol, &sport, SKB_GSO_UDP_TUNNEL);
+	if (err)
+		return err;
+	
+	fou_build_udp(skb, e, fl4, protocol, sport);
+	printk("psp_build_header fini\n");
+	pkt_hex_dump(skb);
+	return 0;
+}
+
+int psp_err_proto_handler(int proto, struct sk_buff *skb, u32 info){
+	printk("psp_err_proto_handler\n");
+	const struct net_protocol *ipprot = rcu_dereference(inet_protos[proto]);
+
+	if (ipprot && ipprot->err_handler) {
+		if (!ipprot->err_handler(skb, info))
+			return 0;
+	}
+
+	return -ENOENT;
+}
+
+int psp_err(struct sk_buff *skb, u32 info){
+	printk("psp_err\n");
+	struct psphdr *psp;
+	int ret;
+	int transport_offset = skb_transport_offset(skb);
+	psp = (struct psphdr *)&udp_hdr(skb)[1];
+
+	ret = psp_err_proto_handler(psp->next_header, skb, info);
+	skb_set_transport_header(skb, transport_offset);
+	return ret;
+}
 
 static const struct ip_tunnel_encap_ops fou_iptun_ops = {
 	.encap_hlen = fou_encap_hlen,
@@ -1156,6 +1460,13 @@ static const struct ip_tunnel_encap_ops gue_iptun_ops = {
 	.build_header = gue_build_header,
 	.err_handler = gue_err,
 };
+
+static const struct ip_tunnel_encap_ops psp_iptun_ops = {
+	.encap_hlen = psp_encap_hlen,
+	.build_header = psp_build_header,
+	.err_handler = psp_err,
+};
+
 
 static int ip_tunnel_encap_add_fou_ops(void)
 {
@@ -1174,6 +1485,14 @@ static int ip_tunnel_encap_add_fou_ops(void)
 		return ret;
 	}
 
+	ret = ip_tunnel_encap_add_ops(&psp_iptun_ops, TUNNEL_ENCAP_PSP);
+	if (ret < 0) {
+		pr_err("can't add psp ops\n");
+		ip_tunnel_encap_del_ops(&fou_iptun_ops, TUNNEL_ENCAP_FOU);
+		ip_tunnel_encap_del_ops(&gue_iptun_ops, TUNNEL_ENCAP_GUE);
+		return ret;
+	}
+
 	return 0;
 }
 
@@ -1181,6 +1500,7 @@ static void ip_tunnel_encap_del_fou_ops(void)
 {
 	ip_tunnel_encap_del_ops(&fou_iptun_ops, TUNNEL_ENCAP_FOU);
 	ip_tunnel_encap_del_ops(&gue_iptun_ops, TUNNEL_ENCAP_GUE);
+	ip_tunnel_encap_del_ops(&psp_iptun_ops, TUNNEL_ENCAP_PSP);
 }
 
 #else
