@@ -246,36 +246,36 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 	void *data;
 	int err = -1;
 	
-	DECLARE_CRYPTO_WAIT(wait);
+	//DECLARE_CRYPTO_WAIT(wait);
 
 	printk("PSP UDP RECV\n");
 
 	// need to work out how to get this
 	u8 key[32] = { 0 };
 
-	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+	//tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
 
-	if (IS_ERR(tfm)) {
-		err = PTR_ERR(tfm);
-		pr_err("PSP: crypto_alloc_aead() has failed: %d.\n", err);
-		return err;
-    	}
+	//if (IS_ERR(tfm)) {
+	//	err = PTR_ERR(tfm);
+	//	pr_err("PSP: crypto_alloc_aead() has failed: %d.\n", err);
+	//	return err;
+    	//}
+//
+	//err = crypto_aead_setauthsize(tfm, PSP_AES_TAG_SIZE);
+	//if (err != 0) {
+	//	pr_err("PSP: crypto_aead_setauthsize() has failed: %d.\n", err);
+	//	crypto_free_aead(tfm);
+	//	return err;
+	//}
 
-	err = crypto_aead_setauthsize(tfm, PSP_AES_TAG_SIZE);
-	if (err != 0) {
-		pr_err("PSP: crypto_aead_setauthsize() has failed: %d.\n", err);
-		crypto_free_aead(tfm);
-		return err;
-	}
-
-	decrypt_len = udp_hdr(skb)->len;
-	decrypt_buf = kmalloc(decrypt_len, GFP_KERNEL);
-	if (decrypt_buf == NULL){
-		err = -ENOMEM;
-		pr_err("PSP: kmalloc() has failed: %d.\n", err);
-		crypto_free_aead(tfm);
-		return err;
-	}
+	//decrypt_len = udp_hdr(skb)->len;
+	//decrypt_buf = kmalloc(decrypt_len, GFP_KERNEL);
+	//if (decrypt_buf == NULL){
+	//	err = -ENOMEM;
+	//	pr_err("PSP: kmalloc() has failed: %d.\n", err);
+	//	crypto_free_aead(tfm);
+	//	return err;
+	//}
 
 	if (!fou)
 		return 1;
@@ -299,27 +299,27 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 
 	data = &psphdr[1];
 
-	memcpy(decrypt_buf, data, decrypt_len);
-	sg_init_one(&sg, decrypt_buf, decrypt_len);
-	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
-				CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
-	
-	aead_request_set_crypt(req, &sg, &sg, decrypt_len, psphdr->iv);
+	//memcpy(decrypt_buf, data, decrypt_len);
+	//sg_init_one(&sg, decrypt_buf, decrypt_len);
+	//aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
+	//			CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
+	//
+	//aead_request_set_crypt(req, &sg, &sg, decrypt_len, psphdr->iv);
 
-	err = crypto_aead_setkey(tfm, key, sizeof(key));
-	if (err != 0) {
-        	pr_err("PSP: crypto_aead_setkey() has failed: %d.\n", err);
-        	return err;
-	}
+	//err = crypto_aead_setkey(tfm, key, sizeof(key));
+	//if (err != 0) {
+        //	pr_err("PSP: crypto_aead_setkey() has failed: %d.\n", err);
+        //	return err;
+	//}
+//
+	//err = crypto_wait_req(crypto_aead_decrypt(req), &wait);
+    	//if (err != 0) {
+        //	pr_err("PSP: Error when decrypting data, it seems tampered. "
+        //       "Ask for a retransmission or verify your key.\n");
+        //	return err;
+	//}
 
-	err = crypto_wait_req(crypto_aead_decrypt(req), &wait);
-    	if (err != 0) {
-        	pr_err("PSP: Error when decrypting data, it seems tampered. "
-               "Ask for a retransmission or verify your key.\n");
-        	return err;
-	}
-
-	memcpy(data, decrypt_buf, decrypt_len - PSP_AES_TAG_SIZE);
+	//memcpy(data, decrypt_buf, decrypt_len - PSP_AES_TAG_SIZE);
 
 	skb_trim(skb, decrypt_len - PSP_AES_TAG_SIZE);
 	__skb_pull(skb, len);
@@ -1335,7 +1335,10 @@ int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *proto
 	DECLARE_CRYPTO_WAIT(wait);
 
 	// need to work out how to get this
-	u8 key[32] = { 0 };
+	u8 key[16] = "0123456789abcdef";
+
+	// need to make room for authentication tag/trailer
+	
 
 	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
 
@@ -1353,6 +1356,8 @@ int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *proto
 	}
 
 	encrypt_len = skb->len + PSP_AES_TAG_SIZE;
+	skb_pad(skb, PSP_AES_TAG_SIZE);
+	skb_put(skb, PSP_AES_TAG_SIZE);
 	encrypt_buf = kmalloc(encrypt_len, GFP_KERNEL);
 	if (!encrypt_buf) {
 		pr_err("PSP: kmalloc() has failed.\n");
@@ -1360,24 +1365,28 @@ int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *proto
 		return -ENOMEM;
 	}
 
-	memcpy(encrypt_buf, skb->data, skb->len);
-	sg_init_one(&sg, encrypt_buf, encrypt_len);
-	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
-				CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
+	memcpy(encrypt_buf, skb->data, encrypt_len - PSP_AES_TAG_SIZE);
+	printk("encrypt buf: %s", encrypt_buf);
+	//sg_init_one(&sg, encrypt_buf, encrypt_len);
+	//aead_request_set_callback(req, 0, crypto_req_done, &wait);
 
-	aead_request_set_crypt(req, &sg, &sg, skb->len, iv);
+	//aead_request_set_crypt(req, &sg, &sg, encrypt_len, iv);
+	//err = crypto_aead_setkey(tfm, key, sizeof(key));
+	if (err != 0) {
+        	pr_err("PSP: crypto_aead_setkey() has failed: %d.\n", err);
+        	return err;
+	}
 
-	err = crypto_wait_req(crypto_aead_encrypt(req), &wait);
+	//err = crypto_wait_req(crypto_aead_encrypt(req), &wait);
 	if (err) {
 		pr_err("PSP: crypto_aead_encrypt() has failed: %d.\n", err);
 		kfree(encrypt_buf);
 		crypto_free_aead(tfm);
 		return err;
 	}
-
-	// need to encrypt the data before pushing the header
-	skb_put(skb, PSP_AES_TAG_SIZE);
-	memcpy(skb->data, encrypt_buf, encrypt_len);
+	printk("encrypt buf: %s", encrypt_buf);
+	// need to encrypt the data before pushing the headers
+	//memcpy(skb->data, encrypt_buf, encrypt_len);
 
 	err = iptunnel_handle_offloads(skb, type);
 	if (err)
