@@ -1319,80 +1319,110 @@ size_t psp_encap_hlen(struct ip_tunnel_encap *e){
 	return sizeof(struct udphdr) + sizeof(struct psphdr);
 }
 
+int encrypt_buffer (void *buffer, size_t len, u8 key, size_t key_size, u8 iv){
+	struct crypto_aead *tfm = NULL;
+	struct aead_request *req = NULL;
+	struct scatterlist sg = { 0 };
+	int err;
+
+	DECLARE_CRYPTO_WAIT(wait);
+
+	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+	if (IS_ERR(tfm)) {
+		printk("crypto_alloc_aead failed\n");
+		return -1;
+	}
+
+	err = crypto_aead_setauthsize(tfm, PSP_AES_TAG_SIZE);
+	if (err != 0) {
+		printk("crypto_aead_setauthsize failed\n");
+		goto out;
+	}
+
+	err = crypto_aead_setkey(tfm, key, key_size);
+	if (err != 0) {
+		err = -ENOMEM;
+		printk("crypto_aead_setkey failed\n");
+		goto out;
+	}
+	req->assoclen = 0;
+
+	//sg_init_one(&sg, buffer, len);
+	//aead_request_set_callback(req, 0, crypto_req_done, &wait);
+	//aead_request_set_crypt(req, &sg, &sg, len - PSP_AES_TAG_SIZE, iv);
+	//err = crypto_wait_req(crypto_aead_encrypt(req), &wait);
+	if (err != 0){
+		printk("crypto_aead_encrypt failed");
+		goto out;
+	}
+	//aead_request_free(req);
+	crypto_free_aead(tfm);
+	return 0;
+out:
+	if (req != NULL) {
+        	aead_request_free(req);
+    	}
+    	if (tfm != NULL) {
+        	crypto_free_aead(tfm);
+	}
+    	return err;
+
+}
+
+void copy_packet_data(struct sk_buff *original_skb, unsigned char **buffer, size_t *length) {
+    int data_offset;
+
+    // Calculate the offset to the start of the network layer header
+    data_offset = skb_network_offset(original_skb);
+
+    // Calculate the length of the packet data starting from the network layer header
+    size_t data_length = original_skb->len - data_offset;
+
+    // Allocate memory for the buffer
+    *buffer = kmalloc(data_length, GFP_ATOMIC);
+    if (!*buffer) {
+        // Handle allocation failure
+        printk(KERN_ERR "Failed to allocate memory for buffer\n");
+        return;
+    }
+
+    // Copy packet data starting from the network layer header to the buffer
+    if (skb_copy_bits(original_skb, data_offset, *buffer, data_length) != 0) {
+        // Handle copy failure
+        printk(KERN_ERR "Failed to copy packet data to buffer\n");
+        kfree(*buffer);
+        return;
+    }
+
+    // Set the length of the copied data
+    *length = data_length;
+}
+
 int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *protocol, __be16 *sport, int type){
 	printk("__psp_build_header\n");
 	struct psphdr *psphdr;
 	size_t hdrlen;
-	struct crypto_aead *tfm = NULL;
-	struct aead_request *req = NULL;
-	void *encrypt_buf;
+	unsigned char *encrypt_buf;
+	void *data;
 	size_t encrypt_len;
 	struct scatterlist sg = { 0 };
 	int err;
-	__be64 iv;
-
-	iv = cpu_to_be64(skb_get_ktime(skb));
-	DECLARE_CRYPTO_WAIT(wait);
-
+	
+	
 	// need to work out how to get this
 	u8 key[16] = "0123456789abcdef";
+	u8 iv[12] = "0123456789ab";
 
-	// need to make room for authentication tag/trailer
-	
-
-	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
-
-	if (IS_ERR(tfm)) {
-		err = PTR_ERR(tfm);
-		pr_err("PSP: crypto_alloc_aead() has failed: %d.\n", err);
-		return err;
-    	}
-
-	err = crypto_aead_setauthsize(tfm, PSP_AES_TAG_SIZE);
-	if (err != 0) {
-		pr_err("PSP: crypto_aead_setauthsize() has failed: %d.\n", err);
-		crypto_free_aead(tfm);
-		return err;
-	}
-
-	encrypt_len = skb->len + PSP_AES_TAG_SIZE;
 	skb_pad(skb, PSP_AES_TAG_SIZE);
 	skb_put(skb, PSP_AES_TAG_SIZE);
-	encrypt_buf = kmalloc(encrypt_len, GFP_KERNEL);
-	if (!encrypt_buf) {
-		pr_err("PSP: kmalloc() has failed.\n");
-		crypto_free_aead(tfm);
-		return -ENOMEM;
-	}
 
-	memcpy(encrypt_buf, skb->data, encrypt_len - PSP_AES_TAG_SIZE);
-	printk("encrypt buf: %s", encrypt_buf);
-	//sg_init_one(&sg, encrypt_buf, encrypt_len);
-	//aead_request_set_callback(req, 0, crypto_req_done, &wait);
-
-	//aead_request_set_crypt(req, &sg, &sg, encrypt_len, iv);
-	//err = crypto_aead_setkey(tfm, key, sizeof(key));
-	if (err != 0) {
-        	pr_err("PSP: crypto_aead_setkey() has failed: %d.\n", err);
-        	return err;
-	}
-
-	//err = crypto_wait_req(crypto_aead_encrypt(req), &wait);
-	if (err) {
-		pr_err("PSP: crypto_aead_encrypt() has failed: %d.\n", err);
-		kfree(encrypt_buf);
-		crypto_free_aead(tfm);
-		return err;
-	}
-	printk("encrypt buf: %s", encrypt_buf);
-	// need to encrypt the data before pushing the headers
-	//memcpy(skb->data, encrypt_buf, encrypt_len);
-
+	encrypt_buf = kmalloc(skb->len + PSP_AES_TAG_SIZE, GFP_ATOMIC);
+	copy_packet_data(skb, &encrypt_buf, &encrypt_len);
+	//encrypt_buffer(encrypt_buf, skb->len + PSP_AES_TAG_SIZE, key, 16, iv);
 	err = iptunnel_handle_offloads(skb, type);
 	if (err)
 		return err;
 
-	//pkt_hex_dump(skb);
 
 	*sport = e->sport ? : udp_flow_src_port(dev_net(skb->dev),
 						skb, 0, 0, false);
@@ -1404,6 +1434,7 @@ int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *proto
 	psphdr->version = 0;
 	psphdr->header_ext_len = 0;
 	psphdr->next_header = *protocol;
+	printk("protcol: %d\n", *protocol);
 	psphdr->r = 0;
 	psphdr->s = 0;
 	psphdr->d = 0;
