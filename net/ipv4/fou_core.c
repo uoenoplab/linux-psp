@@ -234,49 +234,82 @@ drop:
 	return 0;
 }
 
+u8 *decrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, u8 *iv){
+	struct crypto_aead *tfm = NULL;
+	struct aead_request *req = NULL;
+	struct scatterlist sg;
+	u8 *decrypt_buf;
+	// define wait for crypto
+	DECLARE_CRYPTO_WAIT(wait);
+	int err = -1;
+	// allocate tfm
+	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+	if (IS_ERR(tfm)) {
+		printk(KERN_ERR "Failed to allocate transform for gcm(aes)\n");
+		goto out;
+	}
+	err = crypto_aead_setauthsize(tfm, PSP_AES_TAG_SIZE);
+	if (err != 0){
+		printk(KERN_ERR "Failed to set authsize for gcm(aes)\n");
+		goto out;
+	}
+	req = aead_request_alloc(tfm, GFP_KERNEL);
+	if (req == NULL){
+		err = -ENOMEM;
+		printk(KERN_ERR "Failed to allocate request for gcm(aes)\n");
+		goto out;
+	}
+	req->assoclen = 0;
+	decrypt_buf = kmalloc(buffer_size, GFP_ATOMIC);
+	if (decrypt_buf == NULL){
+		err = -ENOMEM;
+		printk(KERN_ERR "Failed to allocate memory for decrypt_buf\n");
+		goto out;
+	}
+
+	memcpy(decrypt_buf, buffer, buffer_size);
+	sg_init_one(&sg, decrypt_buf, buffer_size);
+	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG
+				  | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
+
+	aead_request_set_crypt(req, &sg, &sg, buffer_size, iv);
+	err = crypto_aead_setkey(tfm, key, 16);
+	if (err != 0){
+		printk(KERN_ERR "Failed to set key for gcm(aes)\n");
+		goto out;
+	}
+	err = crypto_wait_req(crypto_aead_decrypt(req), &wait);
+	if (err != 0){
+		printk(KERN_ERR "Failed to decrypt buffer\n");
+		goto out;
+	}
+
+out:
+	if (req != NULL) {
+        	aead_request_free(req);
+    	}
+	if (tfm != NULL) {
+		crypto_free_aead(tfm);
+	}
+	if (buffer != NULL) {
+		kfree(buffer);
+	}
+	
+	if (err != 0){
+		return NULL;
+	} else {
+		return decrypt_buf;
+	};
+}
+
 static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 	struct fou *fou = fou_from_sock(sk);
 	size_t len;
-	//, optlen, hdrlen;
 	struct psphdr *psphdr;
-	//struct crypto_aead *tfm = NULL;
-	//struct aead_request *req = NULL;
-	//void *decrypt_buf;
 	size_t decrypt_len;
-	//struct scatterlist sg = { 0 };
 	void *data;
-	//int err = -1;
-	
-	//DECLARE_CRYPTO_WAIT(wait);
 
 	printk("PSP UDP RECV\n");
-
-	// need to work out how to get this
-	//u8 key[32] = { 0 };
-
-	//tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
-
-	//if (IS_ERR(tfm)) {
-	//	err = PTR_ERR(tfm);
-	//	pr_err("PSP: crypto_alloc_aead() has failed: %d.\n", err);
-	//	return err;
-    	//}
-//
-	//err = crypto_aead_setauthsize(tfm, PSP_AES_TAG_SIZE);
-	//if (err != 0) {
-	//	pr_err("PSP: crypto_aead_setauthsize() has failed: %d.\n", err);
-	//	crypto_free_aead(tfm);
-	//	return err;
-	//}
-
-	//decrypt_len = udp_hdr(skb)->len;
-	//decrypt_buf = kmalloc(decrypt_len, GFP_KERNEL);
-	//if (decrypt_buf == NULL){
-	//	err = -ENOMEM;
-	//	pr_err("PSP: kmalloc() has failed: %d.\n", err);
-	//	crypto_free_aead(tfm);
-	//	return err;
-	//}
 
 	if (!fou)
 		return 1;
@@ -285,6 +318,7 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 	if (!pskb_may_pull(skb, len))
 		goto drop;
 	
+	decrypt_len = ntohs(udp_hdr(skb)->len) - sizeof(struct udphdr);
 	psphdr = (struct psphdr *)&udp_hdr(skb)[1];
 
 	if (fou->family == AF_INET)
@@ -300,29 +334,28 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 
 	data = &psphdr[1];
 
-	//memcpy(decrypt_buf, data, decrypt_len);
-	//sg_init_one(&sg, decrypt_buf, decrypt_len);
-	//aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
-	//			CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
-	//
-	//aead_request_set_crypt(req, &sg, &sg, decrypt_len, psphdr->iv);
+	u8 *key = "0123456789abcdef";
+	u8 *iv = "0123456789ab";
+	u8 *decrypted;
+	u8 *decrypt_buf;
+	decrypt_buf = kmalloc(decrypt_len, GFP_ATOMIC);
+	if (!decrypt_buf) {
+		printk(KERN_ERR "Failed to allocate memory for encrypt_buf\n");
+		return -ENOMEM;
+	}
+	skb_copy_bits(skb, skb_network_offset(skb), decrypt_buf, decrypt_len);
+	printk("Encrypted: %s\n", decrypt_buf);
+	printk("Encrypted len: %d\n", decrypt_len);
+	decrypted = decrypt_buffer(decrypt_buf, decrypt_len, key, iv);
+	if (decrypted == NULL){
+		printk(KERN_ERR "Failed to decrypt buffer\n");
+		goto drop;
+	}
+	printk("Decrypted: %s\n", decrypted);
+	//skb_store_bits(skb, skb_network_offset(skb), decrypted, decrypt_len - PSP_AES_TAG_SIZE);
 
-	//err = crypto_aead_setkey(tfm, key, sizeof(key));
-	//if (err != 0) {
-        //	pr_err("PSP: crypto_aead_setkey() has failed: %d.\n", err);
-        //	return err;
-	//}
-//
-	//err = crypto_wait_req(crypto_aead_decrypt(req), &wait);
-    	//if (err != 0) {
-        //	pr_err("PSP: Error when decrypting data, it seems tampered. "
-        //       "Ask for a retransmission or verify your key.\n");
-        //	return err;
-	//}
 
-	//memcpy(data, decrypt_buf, decrypt_len - PSP_AES_TAG_SIZE);
-
-	skb_trim(skb, decrypt_len - PSP_AES_TAG_SIZE);
+	skb_trim(skb, skb->len - PSP_AES_TAG_SIZE);
 	__skb_pull(skb, len);
 
 	skb_reset_transport_header(skb);
@@ -1394,55 +1427,6 @@ out:
 	//return err;
 }
 
-static int aes_encrypt(const char *plaintext, int plaintext_len,
-                       const u8 *key, const u8 *iv,
-                       char *ciphertext)
-{
-    struct crypto_aead *tfm;
-    struct aead_request *req;
-    struct scatterlist sg_src, sg_dst;
-    int ret;
-
-    tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
-    if (IS_ERR(tfm)) {
-        pr_err("Failed to load tfm: %ld\n", PTR_ERR(tfm));
-        return PTR_ERR(tfm);
-    }
-
-    req = aead_request_alloc(tfm, GFP_KERNEL);
-    if (!req) {
-        pr_err("Failed to allocate request\n");
-        crypto_free_aead(tfm);
-        return -ENOMEM;
-    }
-
-    if (crypto_aead_setkey(tfm, key, 16)) {
-        pr_err("Failed to set key\n");
-        ret = -EINVAL;
-        goto out;
-    }
-
-    //aead_request_set_callback(req, 0, NULL, NULL);
-
-    sg_init_one(&sg_src, plaintext, plaintext_len);
-    sg_init_one(&sg_dst, ciphertext, plaintext_len);
-
-    //aead_request_set_ad(req, 12);
-    //aead_request_set_crypt(req, &sg_src, &sg_dst, plaintext_len, iv);
-
-    //ret = crypto_aead_encrypt(req);
-    if (ret) {
-        pr_err("Encryption failed: %d\n", ret);
-        goto out;
-    }
-
-    ret = 0;
-
-out:
-    aead_request_free(req);
-    crypto_free_aead(tfm);
-    return ret;
-}
 
 void copy_packet_data(struct sk_buff *original_skb, unsigned char **buffer, size_t *length) {
     int data_offset;
@@ -1473,41 +1457,52 @@ void copy_packet_data(struct sk_buff *original_skb, unsigned char **buffer, size
     *length = data_length;
 }
 
+void test_psp_crypto(void){
+	u8 *key = "0123456789abcdef";
+	u8 *iv = "0123456789ab";
+	u8 *buffer = "hello world";
+	u8 *encrypted_buffer = encrypt_buffer(buffer, 12, key, iv);
+	printk("encrypted_buffer: %s\n", encrypted_buffer);
+	u8 *decrypted_buffer = decrypt_buffer(encrypted_buffer, 12 + PSP_AES_TAG_SIZE, key, iv);
+	printk("decrypted_buffer: %s\n", decrypted_buffer);
+}
+
 int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *protocol, __be16 *sport, int type){
 	printk("__psp_build_header\n");
 	struct psphdr *psphdr;
 	size_t hdrlen;
-	unsigned char *encrypt_buf;
-	void *data;
 	size_t encrypt_len;
-	struct scatterlist sg = { 0 };
 	int err;
-	
+
+	test_psp_crypto();
 	
 	// need to work out how to get this
-
-	u8 *plaintext = "Hello, world!";
     	u8 *key = "0123456789abcdef";
-	u8 *iv = "0123456789ab";      // 96-bit IV
-    	u8 *ciphertext = NULL;
-    	int ret;
+	u8 *iv = "0123456789ab";
 
-    	ciphertext = encrypt_buffer(plaintext, sizeof(plaintext), key, iv);
-    	if (ciphertext == NULL) {
-    	    pr_err("Encryption failed\n");
-    	}
+	skb_pad(skb, PSP_AES_TAG_SIZE);
+	skb_put(skb, PSP_AES_TAG_SIZE);
 
-    	pr_info("Ciphertext: %s\n", ciphertext);
-	//skb_pad(skb, PSP_AES_TAG_SIZE);
-	//skb_put(skb, PSP_AES_TAG_SIZE);
+	u8 *encrypt_buf;
 
-	//encrypt_buf = kmalloc(sizeof + PSP_AES_TAG_SIZE, GFP_ATOMIC);
-	//char *string = "hi there!";
-	//memcpy(encrypt_buf, string, 10);
-	//printk("encrypt_buf: %s\n", encrypt_buf);
-	//copy_packet_data(skb, &encrypt_buf, &encrypt_len);
-	//encrypt_buffer(encrypt_buf, 10 + PSP_AES_TAG_SIZE, key, 16, iv);
-	//printk("encrypt_buf: %s\n", encrypt_buf);
+	encrypt_buf = kmalloc(skb->len - skb_mac_header_len(skb), GFP_ATOMIC);
+	if (!encrypt_buf) {
+		printk(KERN_ERR "Failed to allocate memory for encrypt_buf\n");
+		return -ENOMEM;
+	}
+	skb_copy_bits(skb, skb_network_offset(skb), encrypt_buf, skb->len - skb_mac_header_len(skb));
+	
+	u8 *encrypted_pkt = NULL;
+	encrypted_pkt = encrypt_buffer(encrypt_buf, skb->len - skb_mac_header_len(skb), key, iv);
+	printk("encrypted_pkt: %s\n", encrypted_pkt);
+	u8 *decrypted_pkt = NULL;
+	skb_store_bits(skb, skb_network_offset(skb), encrypted_pkt, encrypt_len + PSP_AES_TAG_SIZE);
+	decrypted_pkt = decrypt_buffer(encrypted_pkt, skb->len, key, iv);
+	printk("decrypted_pkt: %s\n", decrypted_pkt);
+	printk("encrypt buf: %s\n", encrypt_buf);
+
+	
+
 	err = iptunnel_handle_offloads(skb, type);
 	if (err)
 		return err;
