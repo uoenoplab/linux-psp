@@ -234,7 +234,7 @@ drop:
 	return 0;
 }
 
-u8 *decrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, u8 *iv){
+u8 *decrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, __be64 iv){
 	struct crypto_aead *tfm = NULL;
 	struct aead_request *req = NULL;
 	struct scatterlist sg;
@@ -272,7 +272,8 @@ u8 *decrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, u8 *iv){
 	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG
 				  | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
 
-	aead_request_set_crypt(req, &sg, &sg, buffer_size, iv);
+	u8 *iv_ptr = (u8 *)&iv;
+	aead_request_set_crypt(req, &sg, &sg, buffer_size, iv_ptr);
 	err = crypto_aead_setkey(tfm, key, 16);
 	if (err != 0){
 		printk(KERN_ERR "Failed to set key for gcm(aes)\n");
@@ -318,7 +319,7 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 	if (!pskb_may_pull(skb, len))
 		goto drop;
 	
-	decrypt_len = ntohs(udp_hdr(skb)->len) - sizeof(struct udphdr);
+	decrypt_len = ntohs(udp_hdr(skb)->len) - len;
 	psphdr = (struct psphdr *)&udp_hdr(skb)[1];
 
 	if (fou->family == AF_INET)
@@ -334,8 +335,12 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 
 	data = &psphdr[1];
 
+	skb_trim(skb, skb->len - PSP_AES_TAG_SIZE);
+	__skb_pull(skb, len);
+
 	u8 *key = "0123456789abcdef";
-	u8 *iv = "0123456789ab";
+	__be64 iv = "01234567";
+
 	u8 *decrypted;
 	u8 *decrypt_buf;
 	decrypt_buf = kmalloc(decrypt_len, GFP_ATOMIC);
@@ -352,11 +357,7 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 		goto drop;
 	}
 	printk("Decrypted: %s\n", decrypted);
-	//skb_store_bits(skb, skb_network_offset(skb), decrypted, decrypt_len - PSP_AES_TAG_SIZE);
-
-
-	skb_trim(skb, skb->len - PSP_AES_TAG_SIZE);
-	__skb_pull(skb, len);
+	skb_store_bits(skb, skb_network_offset(skb), decrypted, decrypt_len - PSP_AES_TAG_SIZE);
 
 	skb_reset_transport_header(skb);
 
@@ -1353,7 +1354,7 @@ size_t psp_encap_hlen(struct ip_tunnel_encap *e){
 	return sizeof(struct udphdr) + sizeof(struct psphdr);
 }
 
-u8 *encrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, u8 *iv){
+u8 *encrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, __be64 iv){
 	struct crypto_aead *tfm = NULL;
 	struct aead_request *req = NULL;
 	struct scatterlist sg;
@@ -1404,7 +1405,8 @@ u8 *encrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, u8 *iv){
 	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
 					CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
 	// set request crypt params
-	aead_request_set_crypt(req, &sg, &sg, buffer_size, iv);
+	u8 *iv_ptr = (u8 *)&iv;
+	aead_request_set_crypt(req, &sg, &sg, buffer_size, iv_ptr);
 	// do encryption
 	err = crypto_wait_req(crypto_aead_encrypt(req), &wait);
 	if (err != 0){
@@ -1459,7 +1461,7 @@ void copy_packet_data(struct sk_buff *original_skb, unsigned char **buffer, size
 
 void test_psp_crypto(void){
 	u8 *key = "0123456789abcdef";
-	u8 *iv = "0123456789ab";
+	__be64 iv = "01234567";
 	u8 *buffer = "hello world";
 	u8 *encrypted_buffer = encrypt_buffer(buffer, 12, key, iv);
 	printk("encrypted_buffer: %s\n", encrypted_buffer);
@@ -1473,31 +1475,42 @@ int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *proto
 	size_t hdrlen;
 	size_t encrypt_len;
 	int err;
+	encrypt_len = skb->len - skb_mac_header_len(skb);
 
-	test_psp_crypto();
+	//test_psp_crypto();
 	
 	// need to work out how to get this
     	u8 *key = "0123456789abcdef";
-	u8 *iv = "0123456789ab";
+	__be64 iv = "01234567";
 
 	skb_pad(skb, PSP_AES_TAG_SIZE);
 	skb_put(skb, PSP_AES_TAG_SIZE);
 
 	u8 *encrypt_buf;
 
-	encrypt_buf = kmalloc(skb->len - skb_mac_header_len(skb), GFP_ATOMIC);
+	encrypt_buf = kmalloc(encrypt_len, GFP_ATOMIC);
 	if (!encrypt_buf) {
 		printk(KERN_ERR "Failed to allocate memory for encrypt_buf\n");
 		return -ENOMEM;
 	}
-	skb_copy_bits(skb, skb_network_offset(skb), encrypt_buf, skb->len - skb_mac_header_len(skb));
+	skb_copy_bits(skb, skb_network_offset(skb), encrypt_buf, encrypt_len);
 	
 	u8 *encrypted_pkt = NULL;
-	encrypted_pkt = encrypt_buffer(encrypt_buf, skb->len - skb_mac_header_len(skb), key, iv);
-	printk("encrypted_pkt: %s\n", encrypted_pkt);
-	u8 *decrypted_pkt = NULL;
+	encrypted_pkt = encrypt_buffer(encrypt_buf, encrypt_len, key, iv);
 	skb_store_bits(skb, skb_network_offset(skb), encrypted_pkt, encrypt_len + PSP_AES_TAG_SIZE);
-	decrypted_pkt = decrypt_buffer(encrypted_pkt, skb->len, key, iv);
+	printk("encrypted_pkt: %s\n", encrypted_pkt);
+	
+	// test decrypt
+	u8 *decrypted_pkt = NULL;
+	u8 *decrypt_buf;
+	decrypt_buf = kmalloc(encrypt_len + PSP_AES_TAG_SIZE, GFP_ATOMIC);
+	if (!decrypt_buf) {
+		printk(KERN_ERR "Failed to allocate memory for decrypt_buf\n");
+		return -ENOMEM;
+	}
+	skb_copy_bits(skb, skb_network_offset(skb), decrypt_buf, encrypt_len + PSP_AES_TAG_SIZE);
+	
+	decrypted_pkt = decrypt_buffer(decrypt_buf, encrypt_len + PSP_AES_TAG_SIZE, key, iv);
 	printk("decrypted_pkt: %s\n", decrypted_pkt);
 	printk("encrypt buf: %s\n", encrypt_buf);
 
