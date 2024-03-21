@@ -54,6 +54,43 @@ struct fou_net {
 	struct mutex fou_lock;
 };
 
+// stolen from https://olegkutkov.me/2019/10/17/printing-sk_buff-data/
+void pkt_hex_dump(struct sk_buff *skb)
+{
+    size_t len;
+    int rowsize = 16;
+    int i, l, linelen, remaining;
+    int li = 0;
+    uint8_t *data, ch; 
+
+    printk("Packet hex dump:\n");
+    data = (uint8_t *) skb_mac_header(skb);
+
+    if (skb_is_nonlinear(skb)) {
+        len = skb->data_len;
+    } else {
+        len = skb->len + 34;
+    }
+
+    remaining = len;
+    for (i = 0; i < len; i += rowsize) {
+        printk("%06d\t", li);
+
+        linelen = min(remaining, rowsize);
+        remaining -= rowsize;
+
+        for (l = 0; l < linelen; l++) {
+            ch = data[l];
+            printk(KERN_CONT "%02X ", (uint32_t) ch);
+        }
+
+        data += linelen;
+        li += 10; 
+
+        printk(KERN_CONT "\n");
+    }
+}
+
 static inline struct fou *fou_from_sock(struct sock *sk)
 {
 	return sk->sk_user_data;
@@ -281,6 +318,7 @@ u8 *decrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, __be64 iv){
 	}
 	err = crypto_wait_req(crypto_aead_decrypt(req), &wait);
 	if (err != 0){
+		printk("err: %d\n", err);
 		printk(KERN_ERR "Failed to decrypt buffer\n");
 		goto out;
 	}
@@ -311,6 +349,9 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 	void *data;
 
 	printk("PSP UDP RECV\n");
+	pkt_hex_dump(skb);
+	printk("skb data: %s\n", skb->data);
+	printk("skb len: %d\n", skb->len);
 
 	if (!fou)
 		return 1;
@@ -320,6 +361,7 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 		goto drop;
 	
 	decrypt_len = ntohs(udp_hdr(skb)->len) - len;
+	printk("decrypt_len: %d\n", decrypt_len);
 	psphdr = (struct psphdr *)&udp_hdr(skb)[1];
 
 	if (fou->family == AF_INET)
@@ -332,35 +374,33 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 	
 	if (psphdr->crypt_offset > skb->len)
 		goto drop;
-
 	data = &psphdr[1];
-
-	skb_trim(skb, skb->len - PSP_AES_TAG_SIZE);
-	__skb_pull(skb, len);
 
 	u8 *key = "0123456789abcdef";
 	__be64 iv = "01234567";
 
-	u8 *decrypted;
-	u8 *decrypt_buf;
-	decrypt_buf = kmalloc(decrypt_len, GFP_ATOMIC);
-	if (!decrypt_buf) {
-		printk(KERN_ERR "Failed to allocate memory for encrypt_buf\n");
-		return -ENOMEM;
+	// 34 is a magic number
+
+	u8 *decrypt_buf = kmalloc(decrypt_len, GFP_ATOMIC);
+	if (decrypt_buf == NULL){
+		printk(KERN_ERR "Failed to allocate memory for decrypt_buf\n");
+		goto drop;
 	}
-	skb_copy_bits(skb, skb_network_offset(skb), decrypt_buf, decrypt_len);
-	printk("Encrypted: %s\n", decrypt_buf);
-	printk("Encrypted len: %d\n", decrypt_len);
-	decrypted = decrypt_buffer(decrypt_buf, decrypt_len, key, iv);
+	printk("network offset: %d\n", skb_network_offset(skb));
+	//skb->len += 34;
+	skb_copy_bits(skb, 0 + len, decrypt_buf, decrypt_len);
+	printk("encrypted_pkt: %s\n", decrypt_buf);
+
+	u8 *decrypted = decrypt_buffer(decrypt_buf, decrypt_len, key, iv);
 	if (decrypted == NULL){
 		printk(KERN_ERR "Failed to decrypt buffer\n");
 		goto drop;
 	}
-	printk("Decrypted: %s\n", decrypted);
-	skb_store_bits(skb, skb_network_offset(skb), decrypted, decrypt_len - PSP_AES_TAG_SIZE);
+	skb_store_bits(skb, 0 + len, decrypted, decrypt_len);
 
+	skb_trim(skb, skb->len - PSP_AES_TAG_SIZE);
+	__skb_pull(skb, len);
 	skb_reset_transport_header(skb);
-
 	return -psphdr->next_header;
 
 	drop:
@@ -1311,42 +1351,6 @@ out:
 	return ret;
 }
 
-// stolen from https://olegkutkov.me/2019/10/17/printing-sk_buff-data/
-void pkt_hex_dump(struct sk_buff *skb)
-{
-    size_t len;
-    int rowsize = 16;
-    int i, l, linelen, remaining;
-    int li = 0;
-    uint8_t *data, ch; 
-
-    printk("Packet hex dump:\n");
-    data = (uint8_t *) skb_mac_header(skb);
-
-    if (skb_is_nonlinear(skb)) {
-        len = skb->data_len;
-    } else {
-        len = skb->len;
-    }
-
-    remaining = len;
-    for (i = 0; i < len; i += rowsize) {
-        printk("%06d\t", li);
-
-        linelen = min(remaining, rowsize);
-        remaining -= rowsize;
-
-        for (l = 0; l < linelen; l++) {
-            ch = data[l];
-            printk(KERN_CONT "%02X ", (uint32_t) ch);
-        }
-
-        data += linelen;
-        li += 10; 
-
-        printk(KERN_CONT "\n");
-    }
-}
 
 size_t psp_encap_hlen(struct ip_tunnel_encap *e){
 	printk("psp_encap_hlen\n");
@@ -1558,6 +1562,7 @@ int psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *protoco
 	
 	fou_build_udp(skb, e, fl4, protocol, sport);
 	printk("psp_build_header fini\n");
+	printk("skb len: %d\n", skb->len);
 	pkt_hex_dump(skb);
 	return 0;
 }
