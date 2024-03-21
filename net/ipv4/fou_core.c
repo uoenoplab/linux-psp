@@ -27,6 +27,9 @@
 
 #include "fou_nl.h"
 
+u8 *key = "0123456789abcdef";
+u8 *iv = "01234567";
+
 struct fou {
 	struct socket *sock;
 	u8 protocol;
@@ -271,7 +274,7 @@ drop:
 	return 0;
 }
 
-u8 *decrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, __be64 iv){
+u8 *decrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, u8 *iv){
 	struct crypto_aead *tfm = NULL;
 	struct aead_request *req = NULL;
 	struct scatterlist sg;
@@ -309,8 +312,11 @@ u8 *decrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, __be64 iv){
 	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG
 				  | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
 
-	u8 *iv_ptr = (u8 *)&iv;
-	aead_request_set_crypt(req, &sg, &sg, buffer_size, iv_ptr);
+	//u8 *iv_ptr = (u8 *)&iv;
+	printk("dec iv: %s\n", iv);
+	printk("dec key: %s\n", key);
+	//aead_request_set_crypt(req, &sg, &sg, buffer_size, iv_ptr);
+	aead_request_set_crypt(req, &sg, &sg, buffer_size, iv);
 	err = crypto_aead_setkey(tfm, key, 16);
 	if (err != 0){
 		printk(KERN_ERR "Failed to set key for gcm(aes)\n");
@@ -376,27 +382,25 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 		goto drop;
 	data = &psphdr[1];
 
-	u8 *key = "0123456789abcdef";
-	__be64 iv = "01234567";
+	//u8 *key = "0123456789abcdef";
+	//__be64 iv = "01234567";
 
-	// 34 is a magic number
-
-	u8 *decrypt_buf = kmalloc(decrypt_len, GFP_ATOMIC);
+	u8 *decrypt_buf = kzalloc(decrypt_len, GFP_ATOMIC);
 	if (decrypt_buf == NULL){
 		printk(KERN_ERR "Failed to allocate memory for decrypt_buf\n");
 		goto drop;
 	}
-	printk("network offset: %d\n", skb_network_offset(skb));
-	//skb->len += 34;
-	skb_copy_bits(skb, 0 + len, decrypt_buf, decrypt_len);
-	printk("encrypted_pkt: %s\n", decrypt_buf);
+	
+	skb_copy_bits(skb, len, decrypt_buf, decrypt_len);
+	//print_hex_dump_bytes("decrypt_buf: ", DUMP_PREFIX_OFFSET, decrypt_buf, decrypt_len);
+	printk("decrypt_buf: %s\n", decrypt_buf);
 
 	u8 *decrypted = decrypt_buffer(decrypt_buf, decrypt_len, key, iv);
 	if (decrypted == NULL){
 		printk(KERN_ERR "Failed to decrypt buffer\n");
 		goto drop;
 	}
-	skb_store_bits(skb, 0 + len, decrypted, decrypt_len);
+	skb_store_bits(skb, len, decrypted, decrypt_len);
 
 	skb_trim(skb, skb->len - PSP_AES_TAG_SIZE);
 	__skb_pull(skb, len);
@@ -1358,7 +1362,7 @@ size_t psp_encap_hlen(struct ip_tunnel_encap *e){
 	return sizeof(struct udphdr) + sizeof(struct psphdr);
 }
 
-u8 *encrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, __be64 iv){
+u8 *encrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, u8 *iv){
 	struct crypto_aead *tfm = NULL;
 	struct aead_request *req = NULL;
 	struct scatterlist sg;
@@ -1409,8 +1413,11 @@ u8 *encrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, __be64 iv){
 	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
 					CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
 	// set request crypt params
-	u8 *iv_ptr = (u8 *)&iv;
-	aead_request_set_crypt(req, &sg, &sg, buffer_size, iv_ptr);
+	//u8 *iv_ptr = (u8 *)&iv;
+	printk("enc iv: %s\n", iv);
+	printk("enc key: %s\n", key);
+	//aead_request_set_crypt(req, &sg, &sg, buffer_size, iv_ptr);
+	aead_request_set_crypt(req, &sg, &sg, buffer_size, iv);
 	// do encryption
 	err = crypto_wait_req(crypto_aead_encrypt(req), &wait);
 	if (err != 0){
@@ -1484,8 +1491,8 @@ int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *proto
 	//test_psp_crypto();
 	
 	// need to work out how to get this
-    	u8 *key = "0123456789abcdef";
-	__be64 iv = "01234567";
+    	//u8 *key = "0123456789abcdef";
+	//__be64 iv = "01234567";
 
 	skb_pad(skb, PSP_AES_TAG_SIZE);
 	skb_put(skb, PSP_AES_TAG_SIZE);
@@ -1502,7 +1509,8 @@ int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *proto
 	u8 *encrypted_pkt = NULL;
 	encrypted_pkt = encrypt_buffer(encrypt_buf, encrypt_len, key, iv);
 	skb_store_bits(skb, skb_network_offset(skb), encrypted_pkt, encrypt_len + PSP_AES_TAG_SIZE);
-	printk("encrypted_pkt: %s\n", encrypted_pkt);
+	printk("encrypted pkt: %s\n", encrypted_pkt);
+	//print_hex_dump_bytes("encrypted_pkt: ", DUMP_PREFIX_OFFSET, encrypted_pkt, encrypt_len + PSP_AES_TAG_SIZE);
 	
 	// test decrypt
 	u8 *decrypted_pkt = NULL;
