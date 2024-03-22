@@ -368,15 +368,18 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 	
 	decrypt_len = ntohs(udp_hdr(skb)->len) - len;
 	printk("decrypt_len: %d\n", decrypt_len);
+	udp_hdr(skb)->len = htons(ntohs(udp_hdr(skb)->len) - PSP_AES_TAG_SIZE);
 	psphdr = (struct psphdr *)&udp_hdr(skb)[1];
 
-	if (fou->family == AF_INET)
-		ip_hdr(skb)->tot_len = htons(ntohs(ip_hdr(skb)->tot_len) - len);
-	else
+	if (fou->family == AF_INET){
+		ip_hdr(skb)->tot_len = htons(ntohs(ip_hdr(skb)->tot_len) - PSP_AES_TAG_SIZE);
+	} else {
+		printk("IPv6\n");
 		goto drop;
-
-	if (psphdr->version != 0)
+	}
+	if (psphdr->version != 0){
 		goto drop;
+	}
 	
 	if (psphdr->crypt_offset > skb->len)
 		goto drop;
@@ -405,10 +408,18 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 	skb_trim(skb, skb->len - PSP_AES_TAG_SIZE);
 	__skb_pull(skb, len);
 	skb_reset_transport_header(skb);
+	printk("psp header next proto: %d\n", -psphdr->next_header);
+	//skb->len += 32;
+	pkt_hex_dump(skb);
+
+	if (iptunnel_pull_offloads(skb))
+		goto drop;
+
 	return -psphdr->next_header;
 
 	drop:
 		kfree_skb(skb);
+		printk("dropped.");
 		return 0;
 	
 }
@@ -1486,6 +1497,7 @@ int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *proto
 	size_t hdrlen;
 	size_t encrypt_len;
 	int err;
+	// set length before pad, as that is the length of the data that will be encrypted
 	encrypt_len = skb->len - skb_mac_header_len(skb);
 
 	//test_psp_crypto();
@@ -1493,9 +1505,10 @@ int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *proto
 	// need to work out how to get this
     	//u8 *key = "0123456789abcdef";
 	//__be64 iv = "01234567";
-
+	printk("length before pad: %d\n", skb->len);
 	skb_pad(skb, PSP_AES_TAG_SIZE);
 	skb_put(skb, PSP_AES_TAG_SIZE);
+	printk("length before pad: %d\n", skb->len);
 
 	u8 *encrypt_buf;
 
@@ -1563,6 +1576,7 @@ int psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *protoco
 
 	__be16 sport;
 	int err;
+	pkt_hex_dump(skb);
 
 	err = __psp_build_header(skb, e, protocol, &sport, SKB_GSO_UDP_TUNNEL);
 	if (err)
@@ -1572,6 +1586,7 @@ int psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *protoco
 	printk("psp_build_header fini\n");
 	printk("skb len: %d\n", skb->len);
 	pkt_hex_dump(skb);
+	skb->ip_summed = CHECKSUM_UNNECESSARY;
 	return 0;
 }
 
