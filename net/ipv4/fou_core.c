@@ -352,6 +352,7 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 	size_t len;
 	struct psphdr *psphdr;
 	size_t decrypt_len;
+	//u8 next_proto;
 	void *data;
 
 	printk("PSP UDP RECV\n");
@@ -370,6 +371,7 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 	printk("decrypt_len: %d\n", decrypt_len);
 	udp_hdr(skb)->len = htons(ntohs(udp_hdr(skb)->len) - PSP_AES_TAG_SIZE);
 	psphdr = (struct psphdr *)&udp_hdr(skb)[1];
+	//next_proto = -psphdr->next_header;
 
 	if (fou->family == AF_INET){
 		ip_hdr(skb)->tot_len = htons(ntohs(ip_hdr(skb)->tot_len) - PSP_AES_TAG_SIZE);
@@ -403,19 +405,42 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 		printk(KERN_ERR "Failed to decrypt buffer\n");
 		goto drop;
 	}
-	skb_store_bits(skb, len, decrypted, decrypt_len);
-
+	
+	// decrease tail pointer by tag size
 	skb_trim(skb, skb->len - PSP_AES_TAG_SIZE);
+	// increase the head pointer by header size
 	__skb_pull(skb, len);
-	skb_reset_transport_header(skb);
-	printk("psp header next proto: %d\n", -psphdr->next_header);
+	// store the decrypted packet starting at the network offset
+	// as the decrypted packet contains the encapsulated IP packet
+	skb_store_bits(skb, skb_network_offset(skb), decrypted, decrypt_len - PSP_AES_TAG_SIZE);
+	
+	//kfree(decrypt_buf);
+	// set the transport header
+	skb_set_transport_header(skb, skb_network_offset(skb) + sizeof(struct iphdr));
+	
+	// debug prints
+	printk("ip proto incoming header: %d", ip_hdr(skb)->protocol);
+	if (ip_hdr(skb)->protocol == IPPROTO_TCP){
+		struct tcphdr *tcphdr = tcp_hdr(skb);
+		printk("tcp destination %d", ntohs(tcphdr->dest));
+		printk("tcp source %d", ntohs(tcphdr->source));
+	} else if (ip_hdr(skb)->protocol == IPPROTO_UDP){
+		struct udphdr *udphdr = udp_hdr(skb);
+		printk("udp destination %d", ntohs(udphdr->dest));
+		printk("udp source %d", ntohs(udphdr->source));
+	} else if(ip_hdr(skb)->protocol == IPPROTO_ICMP){
+		struct icmphdr *icmphdr = icmp_hdr(skb);
+		printk("icmp type %d", icmphdr->type);
+		printk("icmp code %d", icmphdr->code);
+	}
+	//printk("psp header next proto: %d\n", next_proto);
 	//skb->len += 32;
 	pkt_hex_dump(skb);
 
 	if (iptunnel_pull_offloads(skb))
 		goto drop;
 
-	return -psphdr->next_header;
+	return -4;
 
 	drop:
 		kfree_skb(skb);
