@@ -409,7 +409,7 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 	__skb_pull(skb, len);
 	skb_reset_transport_header(skb);
 	printk("psp header next proto: %d\n", -psphdr->next_header);
-	//skb->len += 32;
+	skb->ip_summed = CHECKSUM_UNNECESSARY;
 	pkt_hex_dump(skb);
 
 	if (iptunnel_pull_offloads(skb))
