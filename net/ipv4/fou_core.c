@@ -312,10 +312,6 @@ u8 *decrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, u8 *iv){
 	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG
 				  | CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
 
-	//u8 *iv_ptr = (u8 *)&iv;
-	printk("dec iv: %s\n", iv);
-	printk("dec key: %s\n", key);
-	//aead_request_set_crypt(req, &sg, &sg, buffer_size, iv_ptr);
 	aead_request_set_crypt(req, &sg, &sg, buffer_size, iv);
 	err = crypto_aead_setkey(tfm, key, 16);
 	if (err != 0){
@@ -341,6 +337,7 @@ out:
 	}
 	
 	if (err != 0){
+		kfree(decrypt_buf);
 		return NULL;
 	} else {
 		return decrypt_buf;
@@ -354,11 +351,6 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 	size_t decrypt_len;
 	void *data;
 
-	printk("PSP UDP RECV\n");
-	pkt_hex_dump(skb);
-	printk("skb data: %s\n", skb->data);
-	printk("skb len: %d\n", skb->len);
-
 	if (!fou)
 		return 1;
 	len = sizeof(struct udphdr) + sizeof(struct psphdr);
@@ -367,7 +359,6 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 		goto drop;
 	
 	decrypt_len = ntohs(udp_hdr(skb)->len) - len;
-	printk("decrypt_len: %d\n", decrypt_len);
 	udp_hdr(skb)->len = htons(ntohs(udp_hdr(skb)->len) - PSP_AES_TAG_SIZE);
 	psphdr = (struct psphdr *)&udp_hdr(skb)[1];
 
@@ -385,19 +376,14 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 		goto drop;
 	data = &psphdr[1];
 
-	//u8 *key = "0123456789abcdef";
-	//__be64 iv = "01234567";
-
-	u8 *decrypt_buf = kzalloc(decrypt_len, GFP_ATOMIC);
+	u8 *decrypt_buf = kmalloc(decrypt_len, GFP_ATOMIC);
 	if (decrypt_buf == NULL){
 		printk(KERN_ERR "Failed to allocate memory for decrypt_buf\n");
 		goto drop;
 	}
 	
 	skb_copy_bits(skb, len, decrypt_buf, decrypt_len);
-	//print_hex_dump_bytes("decrypt_buf: ", DUMP_PREFIX_OFFSET, decrypt_buf, decrypt_len);
-	printk("decrypt_buf: %s\n", decrypt_buf);
-
+	
 	u8 *decrypted = decrypt_buffer(decrypt_buf, decrypt_len, key, iv);
 	if (decrypted == NULL){
 		printk(KERN_ERR "Failed to decrypt buffer\n");
@@ -408,9 +394,8 @@ static int psp_udp_recv(struct sock *sk, struct sk_buff *skb){
 	skb_trim(skb, skb->len - PSP_AES_TAG_SIZE);
 	__skb_pull(skb, len);
 	skb_reset_transport_header(skb);
-	printk("psp header next proto: %d\n", -psphdr->next_header);
 	skb->ip_summed = CHECKSUM_UNNECESSARY;
-	pkt_hex_dump(skb);
+	kfree(decrypted);
 
 	if (iptunnel_pull_offloads(skb))
 		goto drop;
@@ -812,7 +797,6 @@ static int fou_create(struct net *net, struct fou_cfg *cfg,
 		tunnel_cfg.gro_complete = gue_gro_complete;
 		break;
 	case FOU_ENCAP_PSP:
-		printk("PSP\n");
 		tunnel_cfg.encap_rcv = psp_udp_recv;
 		tunnel_cfg.gro_receive = psp_gro_receive;
 		tunnel_cfg.gro_complete = psp_gro_complete;
@@ -1368,8 +1352,6 @@ out:
 
 
 size_t psp_encap_hlen(struct ip_tunnel_encap *e){
-	printk("psp_encap_hlen\n");
-	printk("returned: %lu\n", sizeof(struct udphdr) + sizeof(struct psphdr));
 	return sizeof(struct udphdr) + sizeof(struct psphdr);
 }
 
@@ -1424,10 +1406,6 @@ u8 *encrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, u8 *iv){
 	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
 					CRYPTO_TFM_REQ_MAY_SLEEP, crypto_req_done, &wait);
 	// set request crypt params
-	//u8 *iv_ptr = (u8 *)&iv;
-	printk("enc iv: %s\n", iv);
-	printk("enc key: %s\n", key);
-	//aead_request_set_crypt(req, &sg, &sg, buffer_size, iv_ptr);
 	aead_request_set_crypt(req, &sg, &sg, buffer_size, iv);
 	// do encryption
 	err = crypto_wait_req(crypto_aead_encrypt(req), &wait);
@@ -1435,7 +1413,6 @@ u8 *encrypt_buffer (u8 *buffer, size_t buffer_size, u8 *key, u8 *iv){
 		printk("crypto_aead_encrypt failed\n");
 		goto out;
 	}
-	return encrypt_buffer;
 
 out:
 	if (req != NULL) {
@@ -1447,68 +1424,31 @@ out:
 	if (buffer != NULL) {
 		kfree(buffer);
 	}
-	return NULL;
-	//return err;
+
+	if (encrypt_buffer == NULL) {
+		kfree(encrypt_buffer);
+		return NULL;
+ 	} else {
+		return encrypt_buffer;
+	}
 }
 
 
-void copy_packet_data(struct sk_buff *original_skb, unsigned char **buffer, size_t *length) {
-    int data_offset;
 
-    // Calculate the offset to the start of the network layer header
-    data_offset = skb_network_offset(original_skb);
 
-    // Calculate the length of the packet data starting from the network layer header
-    size_t data_length = original_skb->len - data_offset;
-
-    // Allocate memory for the buffer
-    *buffer = kmalloc(data_length, GFP_ATOMIC);
-    if (!*buffer) {
-        // Handle allocation failure
-        printk(KERN_ERR "Failed to allocate memory for buffer\n");
-        return;
-    }
-
-    // Copy packet data starting from the network layer header to the buffer
-    if (skb_copy_bits(original_skb, data_offset, *buffer, data_length) != 0) {
-        // Handle copy failure
-        printk(KERN_ERR "Failed to copy packet data to buffer\n");
-        kfree(*buffer);
-        return;
-    }
-
-    // Set the length of the copied data
-    *length = data_length;
-}
-
-void test_psp_crypto(void){
-	u8 *key = "0123456789abcdef";
-	__be64 iv = "01234567";
-	u8 *buffer = "hello world";
-	u8 *encrypted_buffer = encrypt_buffer(buffer, 12, key, iv);
-	printk("encrypted_buffer: %s\n", encrypted_buffer);
-	u8 *decrypted_buffer = decrypt_buffer(encrypted_buffer, 12 + PSP_AES_TAG_SIZE, key, iv);
-	printk("decrypted_buffer: %s\n", decrypted_buffer);
-}
 
 int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *protocol, __be16 *sport, int type){
-	printk("__psp_build_header\n");
 	struct psphdr *psphdr;
 	size_t hdrlen;
 	size_t encrypt_len;
 	int err;
 	// set length before pad, as that is the length of the data that will be encrypted
 	encrypt_len = skb->len - skb_mac_header_len(skb);
-
-	//test_psp_crypto();
 	
 	// need to work out how to get this
-    	//u8 *key = "0123456789abcdef";
-	//__be64 iv = "01234567";
-	printk("length before pad: %d\n", skb->len);
+
 	skb_pad(skb, PSP_AES_TAG_SIZE);
 	skb_put(skb, PSP_AES_TAG_SIZE);
-	printk("length before pad: %d\n", skb->len);
 
 	u8 *encrypt_buf;
 
@@ -1522,25 +1462,7 @@ int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *proto
 	u8 *encrypted_pkt = NULL;
 	encrypted_pkt = encrypt_buffer(encrypt_buf, encrypt_len, key, iv);
 	skb_store_bits(skb, skb_network_offset(skb), encrypted_pkt, encrypt_len + PSP_AES_TAG_SIZE);
-	printk("encrypted pkt: %s\n", encrypted_pkt);
-	//print_hex_dump_bytes("encrypted_pkt: ", DUMP_PREFIX_OFFSET, encrypted_pkt, encrypt_len + PSP_AES_TAG_SIZE);
 	
-	// test decrypt
-	u8 *decrypted_pkt = NULL;
-	u8 *decrypt_buf;
-	decrypt_buf = kmalloc(encrypt_len + PSP_AES_TAG_SIZE, GFP_ATOMIC);
-	if (!decrypt_buf) {
-		printk(KERN_ERR "Failed to allocate memory for decrypt_buf\n");
-		return -ENOMEM;
-	}
-	skb_copy_bits(skb, skb_network_offset(skb), decrypt_buf, encrypt_len + PSP_AES_TAG_SIZE);
-	
-	decrypted_pkt = decrypt_buffer(decrypt_buf, encrypt_len + PSP_AES_TAG_SIZE, key, iv);
-	printk("decrypted_pkt: %s\n", decrypted_pkt);
-	printk("encrypt buf: %s\n", encrypt_buf);
-
-	
-
 	err = iptunnel_handle_offloads(skb, type);
 	if (err)
 		return err;
@@ -1550,13 +1472,11 @@ int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *proto
 						skb, 0, 0, false);
 	
 	hdrlen = sizeof(struct psphdr);
-	
 	skb_push(skb, hdrlen);
 	psphdr = (struct psphdr *)skb->data;
 	psphdr->version = 0;
 	psphdr->header_ext_len = 0;
 	psphdr->next_header = *protocol;
-	printk("protcol: %d\n", *protocol);
 	psphdr->r = 0;
 	psphdr->s = 0;
 	psphdr->d = 0;
@@ -1566,32 +1486,24 @@ int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *proto
 	psphdr->spi = 1234;
 	psphdr->vc = 0;
 	psphdr->crypt_offset = 0;
-
-	printk("__psp_build_header fini\n");
+	kfree(encrypted_pkt);
 	return 0;
 }
 
 int psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *protocol, struct flowi4 *fl4){
-	printk("psp_build_header\n");
-
 	__be16 sport;
 	int err;
-	pkt_hex_dump(skb);
 
 	err = __psp_build_header(skb, e, protocol, &sport, SKB_GSO_UDP_TUNNEL);
 	if (err)
 		return err;
 	
 	fou_build_udp(skb, e, fl4, protocol, sport);
-	printk("psp_build_header fini\n");
-	printk("skb len: %d\n", skb->len);
-	pkt_hex_dump(skb);
 	skb->ip_summed = CHECKSUM_UNNECESSARY;
 	return 0;
 }
 
 int psp_err_proto_handler(int proto, struct sk_buff *skb, u32 info){
-	printk("psp_err_proto_handler\n");
 	const struct net_protocol *ipprot = rcu_dereference(inet_protos[proto]);
 
 	if (ipprot && ipprot->err_handler) {
@@ -1603,7 +1515,6 @@ int psp_err_proto_handler(int proto, struct sk_buff *skb, u32 info){
 }
 
 int psp_err(struct sk_buff *skb, u32 info){
-	printk("psp_err\n");
 	struct psphdr *psp;
 	int ret;
 	int transport_offset = skb_transport_offset(skb);
