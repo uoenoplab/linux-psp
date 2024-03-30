@@ -1462,7 +1462,7 @@ int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *proto
 	u8 *encrypted_pkt = NULL;
 	encrypted_pkt = encrypt_buffer(encrypt_buf, encrypt_len, key, iv);
 	skb_store_bits(skb, skb_network_offset(skb), encrypted_pkt, encrypt_len + PSP_AES_TAG_SIZE);
-	
+	kfree(encrypted_pkt);
 	err = iptunnel_handle_offloads(skb, type);
 	if (err)
 		return err;
@@ -1486,7 +1486,6 @@ int __psp_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e, u8 *proto
 	psphdr->spi = 1234;
 	psphdr->vc = 0;
 	psphdr->crypt_offset = 0;
-	kfree(encrypted_pkt);
 	return 0;
 }
 
