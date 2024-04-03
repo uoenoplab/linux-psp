@@ -1358,10 +1358,9 @@ new_segment:
 						       pfrag->page,
 						       pfrag->offset,
 						       copy);
-			if (err) {
-				printk(KERN_WARNING "skb_copy to page no cache");
+			if (err) 
 				goto do_error;
-			}
+			
 			/* Update the skb. */
 			if (merge) {
 				skb_frag_size_add(&skb_shinfo(skb)->frags[i - 1], copy);
